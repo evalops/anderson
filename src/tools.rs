@@ -3,10 +3,11 @@
 //!
 //! [`SandboxedExecutor`] runs `exec` inside `sandbox-exec` (macOS) or `bwrap`
 //! (Linux) with a cleared env, wall-clock timeout, and stdout byte cap; opens
-//! `fs_read` with `O_NOFOLLOW` and re-checks the open fd's canonical path
-//! against the bundle; opens `fs_write` with `O_NOFOLLOW` on the leaf; and
-//! fails closed where the platform sandbox is unavailable. The executor
-//! accepts only [`AllowedAction`] — see [`crate::monitor`] for why.
+//! both `fs_read` and `fs_write` by walking from the bundle-root directory fd
+//! one component at a time with `openat(O_NOFOLLOW)`, so a symlink at any
+//! depth fails open with `ELOOP` and `..` is rejected outright. Fails closed
+//! where the platform sandbox is unavailable. The executor accepts only
+//! [`AllowedAction`] — see [`crate::monitor`] for why.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -126,46 +127,56 @@ impl SandboxedExecutor {
         self
     }
 
-    fn within(prefixes: &[PathBuf], path: &std::path::Path) -> bool {
-        prefixes.iter().any(|p| path == p || path.starts_with(p))
-    }
-
     async fn do_fs_read(&self, raw_path: &str) -> Output {
-        // Defence in depth, in this order:
+        // Symmetric with do_fs_write:
         //
-        //   1. Open with `O_NOFOLLOW` on the leaf: a symlink installed at the
-        //      target path fails open with `ELOOP`, before any policy check.
-        //   2. Resolve the canonical path of the *open file descriptor*: a
-        //      legitimate-looking path that points outside the bundle is
-        //      caught here. `F_GETPATH` on macOS / `/proc/self/fd` on Linux.
-        //   3. Compare that canonical path against the bundle's allow-list
-        //      with component-wise `starts_with`.
+        //   1. Canonicalise the parent (path resolution only — no open against
+        //      the target). Combined with the bundle-prefix check below this
+        //      rejects out-of-bundle targets *before* any read-syscall fires.
+        //   2. Walk from the bundle-root dir fd with `openat(O_NOFOLLOW)` per
+        //      component, opening the leaf `O_RDONLY|O_NOFOLLOW`. A symlink
+        //      at any depth fails `ELOOP`; `..` and other non-normal
+        //      components are rejected outright.
         //
-        // Residual: hardlinks can still alias an in-bundle path to an
-        // out-of-bundle inode. Detecting that requires walking an opened
-        // bundle-root dir fd with `openat`, which is left to future work and
-        // documented as a non-defended case in the README.
-        use std::os::unix::io::AsRawFd;
-        let file = match open_read_no_follow(raw_path).await {
-            Ok(f) => f,
-            Err(e) => return err(format!("open {raw_path}: {e}")),
+        // Error messages do *not* echo the resolved canonical path: that
+        // would turn out-of-bundle denials into an existence/path oracle for
+        // the surrounding filesystem.
+        let path = PathBuf::from(raw_path);
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
         };
-        let canonical = match canonical_path_of_fd(file.as_raw_fd()) {
+        let canon_parent = match tokio::fs::canonicalize(&parent).await {
             Ok(p) => p,
-            Err(e) => return err(format!("resolve open fd path: {e}")),
+            Err(_) => return err("fs_read denied: target outside the bundle".into()),
         };
-        if !Self::within(&self.fs_read_allow_prefixes, &canonical) {
-            return err(format!(
-                "fs_read denied: canonical path {} escapes the bundle",
-                canonical.display()
-            ));
-        }
+        let basename = match path.file_name() {
+            Some(n) => n.to_owned(),
+            None => return err("fs_read: empty file name".into()),
+        };
+        let canon = canon_parent.join(&basename);
+        let Some(bundle_root) = self
+            .fs_read_allow_prefixes
+            .iter()
+            .find(|p| canon.starts_with(p))
+            .cloned()
+        else {
+            return err("fs_read denied: target outside the bundle".into());
+        };
+        let relative = match canon.strip_prefix(&bundle_root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => return err("fs_read: internal path-resolution error".into()),
+        };
+        let file = match open_read_walked(&bundle_root, &relative).await {
+            Ok(f) => f,
+            Err(_) => return err("fs_read denied: open failed".into()),
+        };
         use tokio::io::AsyncReadExt;
         let cap = self.limits.fs_max_read_bytes as u64;
         let mut reader = tokio::io::BufReader::new(file).take(cap + 1);
         let mut buf = Vec::with_capacity(8 * 1024);
-        if let Err(e) = reader.read_to_end(&mut buf).await {
-            return err(format!("read {}: {e}", canonical.display()));
+        if reader.read_to_end(&mut buf).await.is_err() {
+            return err("fs_read: read failed".into());
         }
         let truncated = buf.len() > self.limits.fs_max_read_bytes;
         let take = buf.len().min(self.limits.fs_max_read_bytes);
@@ -176,7 +187,7 @@ impl SandboxedExecutor {
         Output {
             content: s,
             provenance_hint: Some(Provenance::File {
-                path: canonical.display().to_string(),
+                path: canon.display().to_string(),
             }),
         }
     }
@@ -329,72 +340,113 @@ fn canonical_prefixes(raw: Vec<String>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Resolve the canonical filesystem path of an already-open file descriptor.
+/// Walk from `bundle_root` to the directory holding the leaf, returning the
+/// dir fd and the leaf's basename as a `CString`. Used by both
+/// [`open_read_walked`] and [`open_write_walked`] so the symlink-refusal
+/// invariant lives in one place.
 ///
-/// macOS: `fcntl(fd, F_GETPATH, buf)`.
-/// Linux: `readlink("/proc/self/fd/N")`.
-///
-/// Both return the resolved path of the inode the descriptor points to. This
-/// is the post-open verification that closes the canonicalize-then-open
-/// TOCTOU window in [`SandboxedExecutor::do_fs_read`].
-fn canonical_path_of_fd(fd: i32) -> std::io::Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        const PATH_MAX: usize = 1024;
-        let mut buf = vec![0u8; PATH_MAX];
-        let ret =
-            unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) };
-        if ret < 0 {
+/// The bundle root itself is opened `O_NOFOLLOW` (a swap of the root for a
+/// symlink is refused). Every intermediate `openat` uses
+/// `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`. `..` and other non-normal components
+/// are rejected outright.
+fn walk_to_leaf_dir(
+    bundle_root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<(std::os::unix::io::OwnedFd, std::ffi::CString)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for comp in relative.components() {
+        match comp {
+            std::path::Component::Normal(n) => components.push(n.to_os_string()),
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("disallowed path component {other:?}"),
+                ));
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "relative path resolves to bundle root",
+        ));
+    }
+
+    let c_root = std::ffi::CString::new(bundle_root.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let root_fd = unsafe {
+        libc::open(
+            c_root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut current: OwnedFd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+    let last = components.len() - 1;
+    for (i, comp) in components.iter().enumerate() {
+        let c_name = std::ffi::CString::new(comp.as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        if i == last {
+            return Ok((current, c_name));
+        }
+        let next_fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        let s = std::str::from_utf8(&buf[..nul]).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 fd path")
-        })?;
-        Ok(PathBuf::from(s))
+        current = unsafe { OwnedFd::from_raw_fd(next_fd) };
     }
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/self/fd/{fd}"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = fd;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "fd-path resolution unavailable on this platform",
-        ))
-    }
+    unreachable!("walk_to_leaf_dir loop returns on the last component")
 }
 
-/// Open `path` for reading with `O_NOFOLLOW` on the leaf. If the target is
-/// a symlink the open fails with `ELOOP` before any policy check runs.
-async fn open_read_no_follow(path: &str) -> std::io::Result<tokio::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = path.to_string();
-    let std_file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
+/// Open `bundle_root/relative` for reading via `openat(O_RDONLY|O_NOFOLLOW)`
+/// from the bundle-root dir fd. Symlinks at any depth fail `ELOOP`.
+async fn open_read_walked(
+    bundle_root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<tokio::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    let bundle_root = bundle_root.to_path_buf();
+    let relative = relative.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let (dir_fd, leaf) = walk_to_leaf_dir(&bundle_root, &relative)?;
+        let leaf_fd = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if leaf_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(leaf_fd) }.into())
     })
     .await
-    .map_err(std::io::Error::other)??;
-    Ok(tokio::fs::File::from_std(std_file))
+    .map_err(std::io::Error::other)?
+    .map(tokio::fs::File::from_std)
 }
 
-/// Open the bundle root, then walk `relative` component-by-component with
-/// `openat(O_NOFOLLOW)`, finally creating/truncating the leaf and writing
-/// `content`. Any symlink encountered at any depth aborts with `ELOOP`; any
-/// `..` or other non-normal component is rejected outright. The bundle root
-/// itself is opened with `O_NOFOLLOW` so a swap of the root directory for a
-/// symlink is also refused.
+/// Open `bundle_root/relative` for writing via
+/// `openat(O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW)` from the bundle-root dir fd,
+/// then write `content` and `sync_data`. Symlinks at any depth fail `ELOOP`.
 async fn open_write_walked(
     bundle_root: &std::path::Path,
     relative: &std::path::Path,
     content: &[u8],
 ) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
     let bundle_root = bundle_root.to_path_buf();
@@ -402,76 +454,22 @@ async fn open_write_walked(
     let content = content.to_vec();
 
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut components: Vec<std::ffi::OsString> = Vec::new();
-        for comp in relative.components() {
-            match comp {
-                std::path::Component::Normal(n) => components.push(n.to_os_string()),
-                other => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("fs_write: disallowed path component {other:?}"),
-                    ));
-                }
-            }
-        }
-        if components.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "fs_write: relative path resolves to bundle root",
-            ));
-        }
-
-        let c_root = std::ffi::CString::new(bundle_root.as_os_str().as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let root_fd = unsafe {
-            libc::open(
-                c_root.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        let (dir_fd, leaf) = walk_to_leaf_dir(&bundle_root, &relative)?;
+        let leaf_fd = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
             )
         };
-        if root_fd < 0 {
+        if leaf_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let mut current: OwnedFd = unsafe { OwnedFd::from_raw_fd(root_fd) };
-
-        let last = components.len() - 1;
-        for (i, comp) in components.iter().enumerate() {
-            let c_name = std::ffi::CString::new(comp.as_bytes())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            if i == last {
-                let leaf_fd = unsafe {
-                    libc::openat(
-                        current.as_raw_fd(),
-                        c_name.as_ptr(),
-                        libc::O_WRONLY
-                            | libc::O_CREAT
-                            | libc::O_TRUNC
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
-                        0o600 as libc::c_uint,
-                    )
-                };
-                if leaf_fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let mut leaf: std::fs::File = unsafe { OwnedFd::from_raw_fd(leaf_fd) }.into();
-                use std::io::Write;
-                leaf.write_all(&content)?;
-                leaf.sync_data()?;
-                return Ok(());
-            }
-            let next_fd = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    c_name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if next_fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            current = unsafe { OwnedFd::from_raw_fd(next_fd) };
-        }
+        let mut leaf_file: std::fs::File = unsafe { OwnedFd::from_raw_fd(leaf_fd) }.into();
+        use std::io::Write;
+        leaf_file.write_all(&content)?;
+        leaf_file.sync_data()?;
         Ok(())
     })
     .await
@@ -626,8 +624,8 @@ mod tests {
 
     #[tokio::test]
     async fn fs_read_rejects_symlink_at_leaf() {
-        // A symlink at the requested path: `O_NOFOLLOW` on the open call
-        // fails with ELOOP before any policy check fires.
+        // A symlink at the requested path: `openat(O_NOFOLLOW)` on the leaf
+        // walk fails with ELOOP before any data is read.
         let bundle = tempfile::tempdir().expect("bundle tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         let outside_file = outside.path().join("secret");
@@ -645,6 +643,46 @@ mod tests {
         assert!(
             !out.content.contains("escape"),
             "symlink target leaked into output: {}",
+            out.content
+        );
+        // The resolved out-of-bundle path must not be echoed back: that turns
+        // denials into a path/existence oracle for the surrounding fs.
+        assert!(
+            !out.content.contains(outside.path().to_str().unwrap()),
+            "denial leaked the resolved out-of-bundle path: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_refuses_intermediate_symlink() {
+        // A symlink at an *intermediate* directory between the bundle root and
+        // the leaf used to let the `open` syscall hit the resolved out-of-
+        // bundle target (with the post-open canonical check only refusing the
+        // *bytes*). The bundle-root openat-walk refuses the symlink itself.
+        let bundle = tempfile::tempdir().expect("bundle");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"OUT-OF-BUNDLE SECRET").expect("write secret");
+        let symdir = bundle.path().join("doorway");
+        std::os::unix::fs::symlink(outside.path(), &symdir).expect("symlink");
+
+        let executor = SandboxedExecutor::new(
+            vec![bundle.path().display().to_string() + "/**"],
+            vec![],
+            ExecutorLimits::default(),
+        );
+        let target = symdir.join("secret.txt");
+        let out = executor.do_fs_read(&target.display().to_string()).await;
+        assert!(out.content.starts_with("error:"), "got: {}", out.content);
+        assert!(
+            !out.content.contains("OUT-OF-BUNDLE SECRET"),
+            "intermediate-symlink escape leaked content: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains(outside.path().to_str().unwrap()),
+            "denial leaked the resolved out-of-bundle path: {}",
             out.content
         );
     }

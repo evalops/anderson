@@ -10,6 +10,13 @@
 //! the end of every session. A model that exfiltrates secrets in its final
 //! answer text now leaves a hash-linked trace; previously the answer was
 //! returned to the caller without ever touching the chain.
+//!
+//! When a [`JsonlFileSink`] is attached and a `write` or `fsync` fails, the
+//! in-memory chain still extends so the session can keep running, but the
+//! first error is captured in [`AuditLog::persist_status`] and is also
+//! returned from [`AuditLog::verify_chain`]. The on-disk file is broken from
+//! that point forward (subsequent entries chain to a `prev_hash` whose
+//! source entry never landed on disk), so the operator must be told.
 
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,6 +65,11 @@ pub struct AuditLog {
     next_seq: u64,
     last_hash: String,
     sink: Option<JsonlFileSink>,
+    /// First persist failure observed on the attached sink, if any. The
+    /// on-disk JSONL becomes unrecoverable from this point: subsequent
+    /// in-memory entries chain to a `prev_hash` whose source entry never
+    /// reached disk, so disk-side replay will fail at the next entry.
+    persist_error: Option<String>,
 }
 
 impl Default for AuditLog {
@@ -73,6 +85,7 @@ impl AuditLog {
             next_seq: 0,
             last_hash: String::new(),
             sink: None,
+            persist_error: None,
         }
     }
 
@@ -118,7 +131,12 @@ impl AuditLog {
             hash,
         };
         if let Some(sink) = self.sink.as_mut() {
-            sink.write(&entry);
+            if let Err(e) = sink.write(&entry) {
+                eprintln!("audit: persist failed for entry {seq}: {e}");
+                if self.persist_error.is_none() {
+                    self.persist_error = Some(format!("audit persist failed at seq {seq}: {e}"));
+                }
+            }
         }
         self.entries.push(entry);
     }
@@ -127,9 +145,24 @@ impl AuditLog {
         &self.entries
     }
 
+    /// `Ok(())` if every entry was durably persisted (or if no sink is
+    /// attached); `Err` with the first failure's message otherwise. The
+    /// in-memory chain is unaffected by sink failures — callers who care
+    /// about the on-disk record should check this before trusting it.
+    pub fn persist_status(&self) -> Result<(), &str> {
+        match &self.persist_error {
+            None => Ok(()),
+            Some(e) => Err(e.as_str()),
+        }
+    }
+
     /// Walk the chain and confirm every link is intact. Returns `Err` on the
-    /// first entry whose `seq`, `prev_hash`, or `hash` does not line up.
+    /// first entry whose `seq`, `prev_hash`, or `hash` does not line up, or
+    /// the captured persist error if a sink write/fsync ever failed.
     pub fn verify_chain(&self) -> Result<(), String> {
+        if let Some(e) = &self.persist_error {
+            return Err(e.clone());
+        }
         let mut prev = String::new();
         for (i, e) in self.entries.iter().enumerate() {
             if e.seq != i as u64 {
@@ -145,6 +178,15 @@ impl AuditLog {
             prev = e.hash.clone();
         }
         Ok(())
+    }
+
+    /// Test hook: simulate a persist failure that has already happened.
+    /// Not exposed in non-test builds.
+    #[cfg(test)]
+    pub(crate) fn force_persist_error_for_test(&mut self, msg: impl Into<String>) {
+        if self.persist_error.is_none() {
+            self.persist_error = Some(msg.into());
+        }
     }
 
     /// One JSON object per line — the conventional shape for a log a separate
@@ -191,18 +233,12 @@ impl JsonlFileSink {
 }
 
 impl JsonlFileSink {
-    fn write(&mut self, entry: &AuditEntry) {
+    fn write(&mut self, entry: &AuditEntry) -> std::io::Result<()> {
         use std::io::Write;
-        let Ok(line) = serde_json::to_string(entry) else {
-            return;
-        };
-        if writeln!(self.file, "{line}").is_err() {
-            eprintln!("audit: write failed for entry {}", entry.seq);
-            return;
-        }
-        if self.file.sync_data().is_err() {
-            eprintln!("audit: fsync failed for entry {}", entry.seq);
-        }
+        let line = serde_json::to_string(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writeln!(self.file, "{line}")?;
+        self.file.sync_data()
     }
 }
 
@@ -255,6 +291,24 @@ mod tests {
             text: "innocuous answer".into(),
         };
         assert!(log.verify_chain().is_err());
+    }
+
+    #[test]
+    fn persist_failure_surfaces_via_verify_chain() {
+        // The in-memory chain still verifies internally, but a sink failure
+        // means the on-disk record is no longer reliable. verify_chain must
+        // surface that — silent partial-write failures used to break the
+        // on-disk audit chain with no signal to the operator.
+        let mut log = AuditLog::new();
+        log.record_decision(&sample_call(), &Decision::Allow);
+        assert!(log.verify_chain().is_ok());
+        assert!(log.persist_status().is_ok());
+        log.force_persist_error_for_test("simulated disk failure");
+        assert!(log.persist_status().is_err());
+        match log.verify_chain() {
+            Err(e) => assert!(e.contains("simulated disk failure"), "got: {e}"),
+            Ok(()) => panic!("expected verify_chain to surface persist error"),
+        }
     }
 
     #[test]

@@ -113,9 +113,17 @@ impl Model for OpenAiModel {
             self.in_flight_call_id = Some(tc.id.clone());
             return match parse_tool_call(&tc) {
                 Ok(parsed) => ModelStep::Call(parsed),
-                Err(e) => ModelStep::Stop {
-                    answer: format!("openai: bad tool call: {e}"),
-                },
+                Err(e) => {
+                    // The parse failed before the call reached the monitor;
+                    // we will never call notify_chunk / notify_denial for it,
+                    // so clear in_flight_call_id rather than leaving a
+                    // dangling reference to a tool_call_id that no tool
+                    // message will ever answer.
+                    self.in_flight_call_id = None;
+                    ModelStep::Stop {
+                        answer: format!("openai: bad tool call: {e}"),
+                    }
+                }
             };
         }
 
@@ -199,13 +207,11 @@ impl Model for OpenAiModel {
 
     async fn notify_chunk(&mut self, chunk: &Chunk) {
         match &chunk.provenance {
-            // Operator, harness, and monitor messages: append as user-role
-            // messages so the model sees them. (We use `user` for operator
-            // content even though we already have a SYSTEM_PROMPT — that's
-            // the standard chat shape.) `Monitor` chunks are informational
-            // notifications; the kernel's `carries_user_authority` check
-            // already prevents the model from citing them as justification.
-            Provenance::User | Provenance::System | Provenance::Monitor => {
+            // Operator and harness messages: append as user-role messages so
+            // the model sees them. (We use `user` for operator content even
+            // though we already have a SYSTEM_PROMPT — that's the standard
+            // chat shape.)
+            Provenance::User | Provenance::System => {
                 if let Ok(user) = ChatCompletionRequestUserMessageArgs::default()
                     .content(format!(
                         "[#{} {}]\n{}",
@@ -218,6 +224,14 @@ impl Model for OpenAiModel {
                     self.messages.push(user.into());
                 }
             }
+            // Monitor notifications (always paired with a preceding
+            // `notify_denial` for the in-flight call) are deliberately
+            // dropped here. Pushing them as user messages would interleave
+            // between the tool replies of a multi-tool-call assistant turn,
+            // which violates OpenAI's contiguous-tool-reply contract for a
+            // single assistant message. The denial reason is already in the
+            // tool reply that `notify_denial` queued, so the model sees it.
+            Provenance::Monitor => {}
             // Tool / file / web chunks: these are responses to a pending tool
             // call. Tag the body with the provenance so the model can reason
             // about which content is intent-trusted and which is not.

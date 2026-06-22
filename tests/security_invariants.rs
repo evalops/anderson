@@ -68,7 +68,10 @@ async fn injection_via_web_chunk_is_denied_and_session_recovers() {
     }
 
     let entries = session.audit().entries();
-    let decisions: Vec<_> = entries.iter().filter_map(|e| e.as_tool_decision()).collect();
+    let decisions: Vec<_> = entries
+        .iter()
+        .filter_map(|e| e.as_tool_decision())
+        .collect();
     assert_eq!(
         decisions.len(),
         2,

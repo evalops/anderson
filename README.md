@@ -134,10 +134,10 @@ USER ──(request + capability bundle)──▶ ORCHESTRATOR
 | Capability bundle as least-authority grant     | [`src/capability.rs`](src/capability.rs) — allow-lists for FS, network, exec; per-arg patterns for exec; spend ceilings on calls/steps/wall-clock |
 | Authentication of intent (§3.7 analog)         | [`src/provenance.rs`](src/provenance.rs) — every context chunk tagged with its source; `carries_user_authority()` is the trust predicate |
 | Tools in their own protection domain (§3.5)    | [`src/tools.rs`](src/tools.rs) — `sandbox-exec` (macOS) / `bwrap` (Linux); fails closed elsewhere |
-| TOCTOU defence on read                         | [`src/tools.rs`](src/tools.rs) — `O_NOFOLLOW` on open, then resolve the open fd's canonical path via `F_GETPATH` / `/proc/self/fd/N` and re-check |
-| Leaf-symlink-safe writes                       | [`src/tools.rs`](src/tools.rs) — `fs_write` opens with `O_NOFOLLOW` on the leaf. Parent-component symlink swaps are not yet defended |
+| Symlink-safe reads                             | [`src/tools.rs`](src/tools.rs) — `fs_read` walks from a bundle-root dir fd with `openat(O_NOFOLLOW)` per component; `..` rejected; error messages do not echo resolved paths, closing the existence/path oracle |
+| Symlink-safe writes                            | [`src/tools.rs`](src/tools.rs) — `fs_write` walks from a bundle-root dir fd with `openat(O_NOFOLLOW)` per component; leaf opened `O_WRONLY\|O_CREAT\|O_TRUNC\|O_NOFOLLOW` |
 | URL allow-listing without prefix bypass        | [`src/capability.rs`](src/capability.rs) — `permits_net_get` parses with the `url` crate and rejects userinfo, defeating the `https://example.com/@evil.com/` class of bypass |
-| Hash-chained durable audit log                 | [`src/audit.rs`](src/audit.rs) — each entry carries SHA-256 of the previous; `JsonlFileSink` `fsync`s. Single-entry edits are detected; whole-chain rewrite is not |
+| Hash-chained durable audit log                 | [`src/audit.rs`](src/audit.rs) — each entry carries SHA-256 of the previous; `JsonlFileSink` `fsync`s; sink failures captured in `persist_error` and surfaced from `verify_chain` / `persist_status`. Single-entry edits are detected; whole-chain rewrite is not |
 | Mediated recovery from denials                 | [`src/orchestrator.rs`](src/orchestrator.rs) — denials surface back to the model so it can revise |
 | OpenAI native tool calling                     | [`src/openai.rs`](src/openai.rs) — stateful history, every tool call in a multi-call turn goes through the monitor, capped at 16 per turn |
 
@@ -188,14 +188,22 @@ nothing. The current revision:
 - The macOS sandbox profile allows reads only on `/usr/lib`, `/System`,
   `/usr/bin`, and a handful of `/etc` entries libc needs. `mach-lookup` is
   filtered to a narrow bootstrap set instead of allow-all.
-- `fs_read` opens with `O_NOFOLLOW` and re-checks the open fd's canonical
-  path. `fs_write` opens the leaf with `O_NOFOLLOW`.
+- Both `fs_read` and `fs_write` walk from a bundle-root directory fd with
+  `openat(O_NOFOLLOW)` per component, refusing symlinks at any depth.
+  `fs_read` denials do not echo the resolved path: the previous
+  open-then-canonical-check pair turned out-of-bundle reads into an
+  existence/path oracle for the surrounding filesystem.
 - Control bytes (`\0`, `\n`, `\r`, anything < 0x20 except tab/space, DEL)
   are rejected at the capability layer for `exec`, closing the
   argv-truncation and log-splitting classes.
 - The OpenAI integration queues every call in a multi-call assistant turn
-  and caps at 16 per turn.
+  and caps at 16 per turn. `Provenance::Monitor` chunks emitted after a
+  denial are absorbed by the synthetic tool reply rather than inserted as
+  a `user` message, preserving OpenAI's contiguous-tool-reply contract.
 - Hash-chained audit log; `JsonlFileSink` `fsync`s each entry to disk.
+  Sink write/fsync failures are captured in `persist_error` and surfaced
+  from `verify_chain` / `persist_status`, instead of being silently
+  `eprintln`'d while the in-memory and on-disk chains drift apart.
 - `bwrap` discovered via PATH + a fallback set instead of a hardcoded
   `/usr/bin/bwrap`.
 - GitHub Actions CI runs fmt, clippy, build, and test on Ubuntu and macOS.
@@ -222,10 +230,6 @@ These are real production gaps. Each is a known piece of work, not a bug.
 - **macOS uses Apple-deprecated `sandbox-exec`.** It works on every Mac but
   has been deprecated since 10.7 and its profile language is undocumented.
   A production harness on macOS should layer a microvm executor on top.
-- **fs_write's parent-symlink window.** The leaf is opened `O_NOFOLLOW`,
-  but a symlink swap on the *parent directory* between `canonicalize` and
-  the write still races. Closing it requires `openat` walks on every path
-  component (future work).
 
 ## Running
 
@@ -275,7 +279,7 @@ cargo run -- openai --model gpt-4o "your prompt"
 cargo test
 ```
 
-22 tests run by default — 16 unit, 6 integration. The integration tests in
+32 tests run by default — 23 unit, 9 integration. The integration tests in
 `tests/security_invariants.rs` are the load-bearing security claims of this
 project asserted as executable expectations.
 
@@ -287,14 +291,21 @@ project asserted as executable expectations.
   file contents) inducing a non-lying model to propose dangerous actions.
 - Exhaustion attacks (model loops, denial loops, runaway tool calls,
   multi-call assistant turns with arbitrary fan-out).
-- Symlink escape at the leaf for both `fs_read` and `fs_write`
-  (`O_NOFOLLOW` plus post-open canonical re-check on read).
+- Symlink escape at *any depth* for both `fs_read` and `fs_write` —
+  bundle-root dir fd walked one component at a time with
+  `openat(O_NOFOLLOW)`; `..` rejected.
+- `fs_read` existence/path oracle: denials do not echo the resolved
+  canonical path, and out-of-bundle targets are rejected before any
+  read-side `open` fires.
 - Unrestricted exec privilege — sandbox + cleared env + timeout + byte
   cap + per-arg patterns + control-byte rejection at the policy layer.
 - URL prefix bypass via userinfo (`https://example.com/@evil.com/`).
 - Bypassing the monitor — sealed `AllowedAction` makes this a compile
   error from any module.
 - Single-entry post-hoc audit edits (detected by hash chain).
+- Silent audit-sink failures: `verify_chain` and `persist_status` surface
+  the first write/fsync error so the operator knows the on-disk JSONL is
+  no longer authoritative.
 
 **Not defended:**
 
@@ -304,12 +315,9 @@ project asserted as executable expectations.
   chain pinning needed).
 - Whole-chain rewrite of the audit log by an attacker with file-write
   access (remote anchor needed).
-- Symlink swap on a *parent directory* of an `fs_write` target — leaf is
-  `O_NOFOLLOW` but parent components are not. `openat` walks on every
-  component would close this and are listed as future work.
 - Hardlink aliasing: a hardlink installed at an in-bundle path pointing
-  to an out-of-bundle inode passes the path-based fd check. Inode-based
-  containment via opened directory fds would close this.
+  to an out-of-bundle inode passes the path-based bundle check. Inode-
+  level containment would close this.
 - A process-level attacker inside the harness address space (out-of-
   process monitor needed).
 - Side channels, host OS compromise, hardware-level attacks.
@@ -326,8 +334,6 @@ project asserted as executable expectations.
 - **Per-call credential issuance.** Tools receive short-lived scoped tokens
   derived from the capability bundle rather than ambient credentials.
 - **Streaming.** Allow incremental processing of model responses.
-- **`openat` walks for fs_write.** Close the parent-symlink race on write
-  by walking the path component-by-component with `O_NOFOLLOW`.
 - **Linux: native seccomp-bpf.** Replace the `bwrap` shim with a Rust
   seccomp policy applied via `prctl` in `pre_exec` for finer control.
 - **Microvm executor.** For high-risk environments, run `exec` inside a
