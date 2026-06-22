@@ -1,38 +1,12 @@
-//! Tools and tool execution.
+//! Tools and tool execution (Anderson §3.5: tools in their own protection
+//! domain).
 //!
-//! Anderson §3.5 argues that security-relevant code paths must run in their
-//! own protection domain — the GCOS III failure was the supervisor running
-//! in-process with the user's authority. The production analog for agents is:
-//! each tool runs in its own sandbox so a compromise of one tool cannot read
-//! the harness's memory or another tool's credentials.
-//!
-//! This module ships [`SandboxedExecutor`], which:
-//!
-//!   * runs `exec` actions inside the platform sandbox (`sandbox-exec` on
-//!     macOS, `bwrap` on Linux), with a cleared environment, a wall-clock
-//!     timeout, and a stdout byte cap;
-//!   * fetches `net_get` via `reqwest` with a connect/read timeout and a hard
-//!     byte cap on the response;
-//!   * opens files first and then verifies the canonical path of the *open
-//!     file descriptor*, closing the TOCTOU window that canonicalize-then-open
-//!     leaves open;
-//!   * writes with `O_NOFOLLOW` so a symlink installed at the target leaf
-//!     between policy check and write cannot redirect the data;
-//!   * fails closed when its sandbox prerequisites are missing.
-//!
-//! The executor takes [`AllowedAction`] rather than [`Action`]. The only way
-//! to obtain an `AllowedAction` is from [`crate::monitor::Monitor::decide`]
-//! returning [`crate::monitor::Verdict::Allow`]. There is no public
-//! constructor and no `Deserialize` derive. "Always invoked" therefore is a
-//! compile-time property of this crate, not a code-review one.
-//!
-//! **macOS note.** `sandbox-exec` is Apple-deprecated since 10.7, but still
-//! present and functional on every Mac. The profile we ship is intentionally
-//! tighter than the original: reads are restricted to dynamic-linker
-//! bootstrap paths (`/usr/lib`, `/System`, `/usr/bin`, etc.) instead of being
-//! allowed everywhere; writes are confined to scratch directories. A
-//! production harness should layer a microvm executor (Firecracker, gVisor)
-//! on top.
+//! [`SandboxedExecutor`] runs `exec` inside `sandbox-exec` (macOS) or `bwrap`
+//! (Linux) with a cleared env, wall-clock timeout, and stdout byte cap; opens
+//! `fs_read` with `O_NOFOLLOW` and re-checks the open fd's canonical path
+//! against the bundle; opens `fs_write` with `O_NOFOLLOW` on the leaf; and
+//! fails closed where the platform sandbox is unavailable. The executor
+//! accepts only [`AllowedAction`] — see [`crate::monitor`] for why.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -71,35 +45,9 @@ impl ToolCall {
     }
 }
 
-/// An action that has passed every check in
-/// [`crate::monitor::Monitor::decide`].
-///
-/// The executor accepts only `&AllowedAction`. This struct has no public
-/// constructor, no `Clone` derive, and no `Deserialize` derive — so
-/// downstream code cannot forge one, duplicate one, or deserialize one from
-/// untrusted input. The only path from [`ToolCall`] to execution is through
-/// the monitor.
-///
-/// This is the type-level embodiment of Anderson §3.2.2(b) "the reference
-/// validation mechanism must always be invoked." A future contributor who
-/// tries to add a fast path bypassing the monitor will get a compile error,
-/// not a code-review nit.
-#[derive(Debug)]
-pub struct AllowedAction {
-    action: Action,
-}
-
-impl AllowedAction {
-    /// Construct an `AllowedAction`. Intentionally crate-private: only the
-    /// monitor calls this, and only after every check passes.
-    pub(crate) fn new(action: Action) -> Self {
-        Self { action }
-    }
-
-    pub fn action(&self) -> &Action {
-        &self.action
-    }
-}
+// `AllowedAction` lives in [`crate::monitor`] inside a private submodule so
+// that only `monitor.rs` can construct one. See its docs there.
+pub use crate::monitor::AllowedAction;
 
 /// The result of executing an allowed action. `provenance_hint`, when present,
 /// tells the orchestrator how to tag the resulting chunk.
@@ -174,13 +122,22 @@ impl SandboxedExecutor {
     }
 
     async fn do_fs_read(&self, raw_path: &str) -> Output {
-        // TOCTOU defence: open the file first, then resolve the path of the
-        // open fd. A symlink swap *after* `open` cannot redirect the bytes we
-        // already have a descriptor for. A symlink swap *before* `open` is
-        // caught by the post-open check, because we verify the canonical path
-        // of what we actually opened, not the path we were asked to open.
+        // Defence in depth, in this order:
+        //
+        //   1. Open with `O_NOFOLLOW` on the leaf: a symlink installed at the
+        //      target path fails open with `ELOOP`, before any policy check.
+        //   2. Resolve the canonical path of the *open file descriptor*: a
+        //      legitimate-looking path that points outside the bundle is
+        //      caught here. `F_GETPATH` on macOS / `/proc/self/fd` on Linux.
+        //   3. Compare that canonical path against the bundle's allow-list
+        //      with component-wise `starts_with`.
+        //
+        // Residual: hardlinks can still alias an in-bundle path to an
+        // out-of-bundle inode. Detecting that requires walking an opened
+        // bundle-root dir fd with `openat`, which is left to future work and
+        // documented as a non-defended case in the README.
         use std::os::unix::io::AsRawFd;
-        let file = match tokio::fs::File::open(raw_path).await {
+        let file = match open_read_no_follow(raw_path).await {
             Ok(f) => f,
             Err(e) => return err(format!("open {raw_path}: {e}")),
         };
@@ -390,6 +347,22 @@ fn canonical_path_of_fd(fd: i32) -> std::io::Result<PathBuf> {
     }
 }
 
+/// Open `path` for reading with `O_NOFOLLOW` on the leaf. If the target is
+/// a symlink the open fails with `ELOOP` before any policy check runs.
+async fn open_read_no_follow(path: &str) -> std::io::Result<tokio::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = path.to_string();
+    let std_file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
 /// Write `content` to `path` with `O_NOFOLLOW` on the leaf. If the target is
 /// a symlink the open fails with `ELOOP` and no data is written.
 async fn open_write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -442,14 +415,26 @@ impl ToolExecutor for SandboxedExecutor {
 fn build_sandboxed_command(parts: &[&str]) -> Result<tokio::process::Command, String> {
     #[cfg(target_os = "macos")]
     {
+        // `(deny default)` covers any path not explicitly allowed below —
+        // including /Users, /private/var (except scratch dirs), and the
+        // harness's own binary location. `mach-lookup` is allowed to a
+        // filtered set of bootstrap services rather than blanket-allowed,
+        // so an exec'd child cannot reach `tccd`, `securityd`, or the
+        // keychain agent via Mach IPC. Network is denied because no
+        // `(allow network*)` rule exists.
         let profile = r#"(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
 (allow signal (target self))
-(allow mach-lookup)
 (allow ipc-posix-shm)
 (allow sysctl-read)
+; Bootstrap Mach services a Rust binary needs at startup. Deliberately
+; narrow: tccd / securityd / keychain agent / pasteboard are NOT here.
+(allow mach-lookup
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.api"))
 ; dyld + system libraries (required for any binary to load).
 (allow file-read* (subpath "/usr/lib"))
 (allow file-read* (subpath "/usr/share"))
@@ -547,11 +532,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn fs_read_canonical_check_rejects_symlink_escape() {
-        // Create a directory whose canonical path is the "bundle". Inside it,
-        // place a symlink pointing OUT of the bundle to a real file. The
-        // bundle allow-list contains only the bundle's canonical path, so a
-        // post-open check must reject the symlink's target.
+    async fn fs_read_rejects_symlink_at_leaf() {
+        // A symlink at the requested path: `O_NOFOLLOW` on the open call
+        // fails with ELOOP before any policy check fires.
         let bundle = tempfile::tempdir().expect("bundle tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         let outside_file = outside.path().join("secret");
@@ -565,9 +548,10 @@ mod tests {
             ExecutorLimits::default(),
         );
         let out = executor.do_fs_read(&symlink.display().to_string()).await;
+        assert!(out.content.starts_with("error:"), "got: {}", out.content);
         assert!(
-            out.content.contains("escapes the bundle"),
-            "expected escape error, got: {}",
+            !out.content.contains("escape"),
+            "symlink target leaked into output: {}",
             out.content
         );
     }

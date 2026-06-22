@@ -1,32 +1,54 @@
-//! The reference monitor — the security kernel of the harness.
+//! The reference monitor — the security kernel.
 //!
-//! Anderson §3.2.2 specifies three properties any reference validation
-//! mechanism must satisfy:
-//!
-//!   (a) it must be **tamper-proof**;
-//!   (b) it must **always be invoked**;
-//!   (c) it must be **small enough to be subject to analysis and tests, the
-//!       completeness of which can be assured**.
-//!
-//! This module is the deliberate embodiment of those properties:
-//!
-//!   * **Tamper-proof.** The monitor consumes only structured `ToolCall`
-//!     values and a typed `Capabilities` bundle. It never reads free-form
-//!     text from the model and has no runtime-configurable policy. There is
-//!     no channel by which model output can rewrite the rules below.
-//!   * **Always invoked.** The executor takes [`crate::tools::AllowedAction`],
-//!     a token that only [`Monitor::decide`] can construct. A future
-//!     contributor who adds a fast path bypassing the monitor will get a
-//!     compile error, not a code-review nit.
-//!   * **Small.** This file. Read it. If you cannot, the abstraction has
-//!     failed.
+//! Anderson §3.2.2 demands three properties: tamper-proof, always-invoked,
+//! and small enough to verify. The "always invoked" property is realised
+//! here by [`AllowedAction`], a token only this module can construct; the
+//! executor takes nothing else. The other two are properties of this file —
+//! read it. The README narrates the design; this file *is* the design.
 
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLog;
 use crate::capability::Capabilities;
 use crate::provenance::Chunk;
-use crate::tools::{Action, AllowedAction, ToolCall};
+use crate::tools::{Action, ToolCall};
+
+/// An action that has passed every check in [`Monitor::decide`].
+///
+/// `AllowedAction` is defined inside the private [`mod sealed`] submodule
+/// below. Its constructor is `pub(super)`, which makes it visible to this
+/// module — and only this module — within the crate. Other modules
+/// (`orchestrator.rs`, `tools.rs`, any future contributor's file) can name
+/// the type but cannot construct one. From outside the crate, only the
+/// re-exported read-only type is visible.
+///
+/// This is the type-level embodiment of Anderson §3.2.2(b): the reference
+/// validation mechanism must always be invoked. A future contributor who
+/// tries to add a fast path bypassing the monitor will get a compile error,
+/// not a code-review nit.
+pub use sealed::AllowedAction;
+
+mod sealed {
+    use crate::tools::Action;
+
+    #[derive(Debug)]
+    pub struct AllowedAction {
+        action: Action,
+    }
+
+    impl AllowedAction {
+        /// Construct an `AllowedAction`. Visible only to the parent module
+        /// (`monitor.rs`), and only after every check in
+        /// [`super::Monitor::decide`] has passed.
+        pub(super) fn new(action: Action) -> Self {
+            Self { action }
+        }
+
+        pub fn action(&self) -> &Action {
+            &self.action
+        }
+    }
+}
 
 /// The serializable decision record that lands in the audit log.
 #[derive(Debug, Clone, Serialize, Deserialize)]

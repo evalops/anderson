@@ -13,13 +13,20 @@ the LLM-agent ecosystem is busy re-discovering those principles by shipping
 prompt-injected agents and patching individual exploit payloads.
 
 This crate is a runnable proof that the 1972 architecture maps cleanly onto
-LLM tool-use. Two of the three reference-monitor properties — *always
-invoked* and *small enough to verify* — are enforced structurally in this
-codebase. The third — *tamper-proof* — is enforced as far as a single-process
-Rust crate can enforce it (no runtime policy, no model-influenceable
-configuration). The provenance check that catches prompt-injected exec
-proposals is **not** structural; it relies on the model citing its
-justifications honestly, and is described as such below.
+LLM tool-use. Two of Anderson's three reference-monitor properties —
+*always invoked* and *small enough to verify* — are enforced by the type
+system and the file count. The third — *tamper-proof* — is enforced as far
+as a single-process Rust crate can enforce it; defence in depth against a
+process-level attacker requires the executor in a separate address space,
+which is left to future work.
+
+The provenance check that catches prompt-injected exec proposals is **not**
+structural. It assumes an honest model. Why ship it anyway: it catches the
+common failure mode (a non-lying model led off-track by hostile context),
+and a model that fabricates citations leaves the fabrication in the audit
+log. The structural part of this design — *every action must declare its
+justification chunks* — is the hook a future semantic intent verifier will
+hang from.
 
 [Anderson Report]: https://csrc.nist.gov/csrc/media/publications/conference-paper/1998/10/08/proceedings-of-the-21st-nissc-1998/documents/early-cs-papers/ande72.pdf
 
@@ -54,24 +61,20 @@ satisfy:
 
 For an LLM agent, this crate's stance on each:
 
-- **Always invoked — enforced at the type level.** The executor takes
-  [`AllowedAction`](src/tools.rs), a token with no public constructor, no
-  `Clone` derive, and no `Deserialize` derive. The only path to obtain one is
-  [`Monitor::decide`](src/monitor.rs) returning
-  [`Verdict::Allow`](src/monitor.rs). A future contributor who tries to add a
-  fast path bypassing the monitor gets a compile error.
-- **Small enough to verify.** The security kernel is
-  [`monitor.rs`](src/monitor.rs) (182 non-test lines),
-  [`capability.rs`](src/capability.rs) (187 non-test lines), and
-  [`provenance.rs`](src/provenance.rs) (62 lines). 431 lines you can read
-  in a sitting.
-- **Tamper-proof — within the limits of a single-process design.** The
+- **Always invoked — at the type level.** [`AllowedAction`](src/monitor.rs)
+  lives in a private submodule with a `pub(super)` constructor. Only
+  `monitor.rs` can build one; the executor accepts nothing else. No
+  `Clone`, no `Deserialize`. Bypassing the monitor — even from another file
+  in this crate — is a compile error.
+- **Small enough to verify.** [`monitor.rs`](src/monitor.rs),
+  [`capability.rs`](src/capability.rs), and
+  [`provenance.rs`](src/provenance.rs). Read them.
+- **Tamper-proof, within the limits of a single-process design.** The
   monitor consumes only structured `ToolCall` values and a typed
-  `Capabilities` bundle; it never reads free-form text from the model and
-  has no runtime-configurable policy. A *process-level* attacker who can run
-  arbitrary code inside this harness's address space owns everything; for
-  defence in depth against that threat, the executor and the monitor should
-  live in separate processes — see [future work](#future-work).
+  `Capabilities` bundle. No runtime-configurable policy, no free-form text
+  from the model. A process-level attacker inside this harness's address
+  space owns everything; defence in depth against that is an
+  out-of-process monitor, listed under [future work](#future-work).
 
 ## Architecture
 
@@ -127,15 +130,16 @@ USER ──(request + capability bundle)──▶ ORCHESTRATOR
 
 | Anderson principle                             | Where it lives in this crate                                                                                        |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Reference monitor: small / tamper-proof / always-invoked | [`src/monitor.rs`](src/monitor.rs) — 182 non-test lines; no runtime-configurable policy; called via a token type the executor cannot bypass |
-| Capability bundle as least-authority grant     | [`src/capability.rs`](src/capability.rs) — allow-lists for FS, network, exec; per-arg patterns for exec; hard limits on calls/steps/wall-clock/byte-caps |
+| Reference monitor (small, tamper-proof in-process, always-invoked via type) | [`src/monitor.rs`](src/monitor.rs) — no runtime-configurable policy; sealed `AllowedAction` token the executor demands |
+| Capability bundle as least-authority grant     | [`src/capability.rs`](src/capability.rs) — allow-lists for FS, network, exec; per-arg patterns for exec; spend ceilings on calls/steps/wall-clock |
 | Authentication of intent (§3.7 analog)         | [`src/provenance.rs`](src/provenance.rs) — every context chunk tagged with its source; `carries_user_authority()` is the trust predicate |
-| Tools in their own protection domain (§3.5)    | [`src/tools.rs`](src/tools.rs) — `SandboxedExecutor` uses `sandbox-exec` on macOS / `bwrap` on Linux for `exec`; fails closed elsewhere |
-| Post-open path verification                    | [`src/tools.rs`](src/tools.rs) — open the file, then resolve the open fd's canonical path via `F_GETPATH` (macOS) or `/proc/self/fd/N` (Linux); closes the TOCTOU window canonicalize-then-open leaves |
-| Symlink-safe writes                            | [`src/tools.rs`](src/tools.rs) — `fs_write` opens with `O_NOFOLLOW` on the leaf; a symlink planted at the target between policy check and write cannot redirect the data |
-| Hash-chained, optionally durable audit log     | [`src/audit.rs`](src/audit.rs) — each entry carries the SHA-256 of the previous entry's hash; `JsonlFileSink` writes JSONL with `fsync` after every line |
-| Mediated recovery from denials                 | [`src/orchestrator.rs`](src/orchestrator.rs) — denials are surfaced back to the model so it can revise its plan     |
-| OpenAI native tool calling                     | [`src/openai.rs`](src/openai.rs) — stateful message history, tool-call IDs preserved across turns, every tool call in a multi-call assistant message goes through the monitor |
+| Tools in their own protection domain (§3.5)    | [`src/tools.rs`](src/tools.rs) — `sandbox-exec` (macOS) / `bwrap` (Linux); fails closed elsewhere |
+| TOCTOU defence on read                         | [`src/tools.rs`](src/tools.rs) — `O_NOFOLLOW` on open, then resolve the open fd's canonical path via `F_GETPATH` / `/proc/self/fd/N` and re-check |
+| Leaf-symlink-safe writes                       | [`src/tools.rs`](src/tools.rs) — `fs_write` opens with `O_NOFOLLOW` on the leaf. Parent-component symlink swaps are not yet defended |
+| URL allow-listing without prefix bypass        | [`src/capability.rs`](src/capability.rs) — `permits_net_get` parses with the `url` crate and rejects userinfo, defeating the `https://example.com/@evil.com/` class of bypass |
+| Hash-chained durable audit log                 | [`src/audit.rs`](src/audit.rs) — each entry carries SHA-256 of the previous; `JsonlFileSink` `fsync`s. Single-entry edits are detected; whole-chain rewrite is not |
+| Mediated recovery from denials                 | [`src/orchestrator.rs`](src/orchestrator.rs) — denials surface back to the model so it can revise |
+| OpenAI native tool calling                     | [`src/openai.rs`](src/openai.rs) — stateful history, every tool call in a multi-call turn goes through the monitor, capped at 16 per turn |
 
 ## The provenance check is not a structural defence
 
@@ -168,42 +172,33 @@ Why ship it anyway? Three reasons:
 Production deployments should pair this check with the intent verifier, not
 rely on it alone.
 
-## Other gaps closed in this revision
+## What changed from the original POC
 
-The original POC had several places where the implementation was looser
-than the README implied. They are now tightened:
+The original was program-only on exec, allowed `(allow file-read*)` in the
+macOS sandbox, canonicalised-then-opened for `fs_read`, processed only the
+first tool call in a multi-call assistant turn (and silently dropped the
+rest), and had a `Vec`-as-audit-log "append-only" property enforced by
+nothing. The current revision:
 
-- **Per-argument exec policy.** The original `exec: Vec<String>` allow-list
-  was program-name-only — `exec: ["curl"]` permitted any URL. The new
-  [`ExecRule`](src/capability.rs) requires the operator to declare per-arg
-  patterns. A bundle that says "only curl URLs under https://example.com/"
-  is now enforceable.
-- **Tighter macOS sandbox profile.** The original profile allowed
-  `(allow file-read*)` everywhere, so an exec'd `cat /etc/passwd` would
-  succeed. The new profile restricts reads to dynamic-linker bootstrap
-  paths (`/usr/lib`, `/System`, `/usr/bin`, plus a handful of `/etc`
-  entries libc needs at startup). Writes are confined to scratch dirs.
-- **TOCTOU defence for fs_read.** The original canonicalised the path then
-  opened — a window an attacker could swap a symlink through. The new
-  implementation opens first, then resolves the open fd's canonical path
-  via `fcntl F_GETPATH` (macOS) or `readlink /proc/self/fd/N` (Linux), and
-  rejects if that path is outside the bundle.
-- **Symlink-safe fs_write.** Writes use `O_NOFOLLOW` on the leaf: a
-  symlink planted at the target between the policy check and the write
-  causes the open to fail rather than redirect data.
-- **Multi-tool-call assistant turns.** The original processed the first
-  tool call and silently synthesised "ignored" tool messages for the rest.
-  The new implementation queues every call from an assistant turn and
-  drains them one per `next_step`, so each gets full monitor scrutiny.
-- **Tamper-evident audit log.** Each entry now carries the SHA-256 of the
-  previous entry's hash; `verify_chain` rejects any post-hoc edit.
-  `JsonlFileSink` writes the chain to disk with `fsync` after every entry.
-- **`bwrap` path discovery on Linux.** The hardcoded `/usr/bin/bwrap`
-  failed closed on distros that put it elsewhere. The new code probes
-  common paths and `$PATH`.
-- **CI.** GitHub Actions workflow runs `cargo fmt --check`, `cargo
-  clippy -- -D warnings`, and `cargo test` on macOS and Linux on every
-  push.
+- Sealed [`AllowedAction`](src/monitor.rs) makes "always invoked" a type
+  property rather than a code-review one.
+- [`ExecRule` + `ArgPattern`](src/capability.rs) pin per-position arg
+  patterns. `permits_net_get` parses URLs and rejects userinfo, defeating
+  the `https://example.com/@evil.com/` prefix-bypass class.
+- The macOS sandbox profile allows reads only on `/usr/lib`, `/System`,
+  `/usr/bin`, and a handful of `/etc` entries libc needs. `mach-lookup` is
+  filtered to a narrow bootstrap set instead of allow-all.
+- `fs_read` opens with `O_NOFOLLOW` and re-checks the open fd's canonical
+  path. `fs_write` opens the leaf with `O_NOFOLLOW`.
+- Control bytes (`\0`, `\n`, `\r`, anything < 0x20 except tab/space, DEL)
+  are rejected at the capability layer for `exec`, closing the
+  argv-truncation and log-splitting classes.
+- The OpenAI integration queues every call in a multi-call assistant turn
+  and caps at 16 per turn.
+- Hash-chained audit log; `JsonlFileSink` `fsync`s each entry to disk.
+- `bwrap` discovered via PATH + a fallback set instead of a hardcoded
+  `/usr/bin/bwrap`.
+- GitHub Actions CI runs fmt, clippy, build, and test on Ubuntu and macOS.
 
 ## What this POC still deliberately does not include
 
@@ -289,34 +284,35 @@ project asserted as executable expectations.
 **Defended:**
 
 - Prompt injection from untrusted content (web pages, retrieved documents,
-  file contents) inducing a non-lying model to propose dangerous actions
-  on the user's behalf.
-- Exhaustion attacks (model loops, denial loops, runaway tool calls).
-- TOCTOU/symlink escape from the FS allow-list on read (post-open
-  verification) and on write (O_NOFOLLOW on the leaf).
-- Unrestricted exec privilege (sandbox + cleared env + timeout + byte cap
-  + per-arg patterns).
-- Unrestricted network egress (allow-list + timeout + byte cap).
-- Bypassing the monitor by calling the executor directly (compile-time
-  prevented via [`AllowedAction`](src/tools.rs)).
-- Post-hoc audit-log edits (hash chain detects them).
+  file contents) inducing a non-lying model to propose dangerous actions.
+- Exhaustion attacks (model loops, denial loops, runaway tool calls,
+  multi-call assistant turns with arbitrary fan-out).
+- Symlink escape at the leaf for both `fs_read` and `fs_write`
+  (`O_NOFOLLOW` plus post-open canonical re-check on read).
+- Unrestricted exec privilege — sandbox + cleared env + timeout + byte
+  cap + per-arg patterns + control-byte rejection at the policy layer.
+- URL prefix bypass via userinfo (`https://example.com/@evil.com/`).
+- Bypassing the monitor — sealed `AllowedAction` makes this a compile
+  error from any module.
+- Single-entry post-hoc audit edits (detected by hash chain).
 
 **Not defended:**
 
-- A model that *fabricates* citations to slip past the provenance check.
-  (Semantic intent verifier needed; see future work.)
-- Compromise of the model weights, system prompt, or tool catalog. (Supply
-  chain pinning needed.)
-- Side channels (cache timing, token-count signals to a colluding tool).
-- The platform sandbox itself failing. `sandbox-exec` is deprecated;
-  `bwrap` requires careful configuration.
-- Physical access, host OS compromise, hardware-level attacks.
-- Symlink swap on a parent directory of an `fs_write` target. The leaf is
-  `O_NOFOLLOW`, but the parent chain is not.
-- A process-level attacker inside the harness's address space. The monitor
-  is in-process; defence in depth requires a multi-process design.
-- A live attacker with write access to the audit file. The hash chain is
-  tamper-*evident*, not tamper-*proof*; full chains can be replaced.
+- A model that *fabricates* citations to slip past the provenance check
+  (semantic intent verifier needed).
+- Compromise of the model weights, system prompt, or tool catalog (supply
+  chain pinning needed).
+- Whole-chain rewrite of the audit log by an attacker with file-write
+  access (remote anchor needed).
+- Symlink swap on a *parent directory* of an `fs_write` target — leaf is
+  `O_NOFOLLOW` but parent components are not. `openat` walks on every
+  component would close this and are listed as future work.
+- Hardlink aliasing: a hardlink installed at an in-bundle path pointing
+  to an out-of-bundle inode passes the path-based fd check. Inode-based
+  containment via opened directory fds would close this.
+- A process-level attacker inside the harness address space (out-of-
+  process monitor needed).
+- Side channels, host OS compromise, hardware-level attacks.
 
 ## Future work
 

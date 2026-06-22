@@ -61,6 +61,11 @@ Be honest about justifications. Lying will be visible in the audit log."#;
 
 const TOOL_NAMES: &[&str] = &["fs_read", "fs_write", "net_get", "exec"];
 
+/// Maximum tool calls accepted in a single assistant turn. A higher value
+/// risks quadratic blowup of `messages` and `context`; the spend ceiling
+/// bounds executed calls but not queued ones.
+const MAX_TOOL_CALLS_PER_TURN: usize = 16;
+
 pub struct OpenAiModel {
     client: Client<OpenAIConfig>,
     model: String,
@@ -157,9 +162,21 @@ impl Model for OpenAiModel {
 
         match msg.tool_calls {
             Some(calls) if !calls.is_empty() => {
-                // Queue every tool call from this assistant turn and pop the
-                // first. Each subsequent `next_step` will pop the next one, so
-                // every tool call goes through the monitor.
+                // Bound the per-turn fan-out. The spend ceiling bounds
+                // *executed* calls, but every queued call still consumes a
+                // monitor decision, a context chunk, and a message-history
+                // entry. A model that returns 10,000 tool calls in one
+                // assistant turn would blow up both before the spend
+                // ceiling fires.
+                if calls.len() > MAX_TOOL_CALLS_PER_TURN {
+                    return ModelStep::Stop {
+                        answer: format!(
+                            "openai: refusing assistant turn with {} tool calls (cap {})",
+                            calls.len(),
+                            MAX_TOOL_CALLS_PER_TURN
+                        ),
+                    };
+                }
                 self.pending_calls.extend(calls);
                 let first = self.pending_calls.pop_front().expect("non-empty");
                 self.in_flight_call_id = Some(first.id.clone());

@@ -1,21 +1,9 @@
-//! Append-only, hash-chained audit log.
+//! Hash-chained audit log (Anderson §3.3).
 //!
-//! Anderson §3.3: certification requires "verification that the system as
-//! implemented conforms to the model" and "a demonstration that an
-//! implemented instance of the model corresponds to the model." You cannot
-//! certify what you cannot observe. Every monitor decision — allow, deny,
-//! escalate — is recorded here, in order, with the full call and reason.
-//!
-//! "Append-only" used to mean "we only call `Vec::push`." That is now
-//! enforced more rigorously: each entry carries the SHA-256 of the previous
-//! entry's hash, so any modification to a recorded entry breaks the chain
-//! and [`AuditLog::verify_chain`] will reject it. The log can also be sunk
-//! to disk via [`JsonlFileSink`], which `fsync`s after every line.
-//!
-//! Tamper-evidence is not tamper-proofing. A live attacker with write access
-//! to the audit file can truncate it, replay it, or replace the whole chain
-//! with a fresh one. Real tamper-proofing requires shipping each entry off
-//! the host (a Merkle-anchored remote sink) and is out of scope for the POC.
+//! Each entry carries the SHA-256 of `(seq, ts, call, decision, prev_hash)`,
+//! so a single-entry edit breaks the chain and [`AuditLog::verify_chain`]
+//! rejects it. A whole-chain rewrite by an attacker with file-write access
+//! still wins — see the README threat model.
 
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,17 +27,11 @@ pub struct AuditEntry {
     pub hash: String,
 }
 
-/// Where an [`AuditLog`] sends entries as they are appended. The default log
-/// has no sink. Adding [`JsonlFileSink`] gives durable persistence.
-pub trait AuditSink: Send {
-    fn write(&mut self, entry: &AuditEntry);
-}
-
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
     next_seq: u64,
     last_hash: String,
-    sink: Option<Box<dyn AuditSink>>,
+    sink: Option<JsonlFileSink>,
 }
 
 impl Default for AuditLog {
@@ -68,8 +50,8 @@ impl AuditLog {
         }
     }
 
-    /// Construct a log that also writes every entry to `sink`.
-    pub fn with_sink(sink: Box<dyn AuditSink>) -> Self {
+    /// Construct a log that also writes every entry to a JSONL file.
+    pub fn with_sink(sink: JsonlFileSink) -> Self {
         let mut l = Self::new();
         l.sink = Some(sink);
         l
@@ -173,7 +155,7 @@ impl JsonlFileSink {
     }
 }
 
-impl AuditSink for JsonlFileSink {
+impl JsonlFileSink {
     fn write(&mut self, entry: &AuditEntry) {
         use std::io::Write;
         let Ok(line) = serde_json::to_string(entry) else {
@@ -228,7 +210,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("audit.jsonl");
         let sink = JsonlFileSink::new(&path).expect("open sink");
-        let mut log = AuditLog::with_sink(Box::new(sink));
+        let mut log = AuditLog::with_sink(sink);
         log.record(&sample_call(), &Decision::Allow);
         log.record(&sample_call(), &Decision::Deny { reason: "x".into() });
         let contents = std::fs::read_to_string(&path).expect("read sink");
