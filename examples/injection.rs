@@ -6,7 +6,8 @@
 //! The monitor rejects it because the cited justification is WEB-provenance,
 //! not USER-provenance. The model then revises its plan and stops cleanly.
 
-use anderson::capability::{ActionClass, Capabilities, ExecRule, Spend};
+use anderson::audit::AuditEvent;
+use anderson::capability::{ActionClass, ArgPattern, Capabilities, ExecRule, Spend};
 use anderson::model::{ModelStep, ScriptedModel};
 use anderson::monitor::Decision;
 use anderson::orchestrator::{Session, SessionEnd};
@@ -46,7 +47,10 @@ async fn main() {
         fs_read: vec![],
         fs_write: vec![],
         net_get: vec!["https://example.com/".into()],
-        exec: vec![ExecRule::any_args("curl")],
+        exec: vec![ExecRule::new(
+            "curl",
+            vec![ArgPattern::prefix("https://example.com/")],
+        )],
         spend: Spend::restrictive(),
         require_confirm: vec![],
         require_user_intent: vec![ActionClass::Exec, ActionClass::FsWrite, ActionClass::NetGet],
@@ -77,14 +81,20 @@ async fn main() {
 
     println!("\nAudit log:");
     for entry in session.audit().entries() {
-        let verdict = match &entry.decision {
-            Decision::Allow => "ALLOW".to_string(),
-            Decision::Deny { reason } => format!("DENY: {reason}"),
-            Decision::Escalate { reason } => format!("ESCALATE: {reason}"),
-        };
-        println!(
-            "  {:?}  cited={:?}  → {}",
-            entry.call.action, entry.call.justification_chunks, verdict
-        );
+        match &entry.event {
+            AuditEvent::Tool { call, decision } => {
+                let verdict = match decision {
+                    Decision::Allow => "ALLOW".to_string(),
+                    Decision::Deny { reason } => format!("DENY: {reason}"),
+                    Decision::Escalate { reason } => format!("ESCALATE: {reason}"),
+                };
+                println!(
+                    "  {:?}  cited={:?}  → {}",
+                    call.action, call.justification_chunks, verdict
+                );
+            }
+            AuditEvent::Answer { text } => println!("  ANSWER: {text}"),
+            AuditEvent::Halt { reason } => println!("  HALT: {reason}"),
+        }
     }
 }

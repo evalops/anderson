@@ -19,6 +19,13 @@ pub enum Provenance {
     User,
     /// The harness's own system prompt, set by the trusted operator.
     System,
+    /// A notification emitted by the orchestrator or monitor (e.g. a denial
+    /// reason). Informational only — *not* a source of intent. Citing one of
+    /// these as justification for a high-impact action will be rejected,
+    /// which is what closes the authority-laundering loop: a model that has
+    /// just had an action denied cannot turn the denial message into the
+    /// authority required to retry it.
+    Monitor,
     /// Output returned by a tool the agent invoked.
     Tool { name: String, call_id: u64 },
     /// Content fetched from the network.
@@ -30,10 +37,10 @@ pub enum Provenance {
 impl Provenance {
     /// True iff this provenance is treated as carrying operator authority.
     ///
-    /// Only `User` and `System` qualify. Tool output, web content, and file
-    /// content are all *untrusted as sources of intent* — they may inform the
-    /// model's reasoning, but they cannot, on their own, authorize an action
-    /// the operator did not request.
+    /// Only `User` and `System` qualify. `Monitor` notifications, tool output,
+    /// web content, and file content are all *untrusted as sources of intent*
+    /// — they may inform the model's reasoning, but they cannot, on their own,
+    /// authorize an action the operator did not request.
     pub fn carries_user_authority(&self) -> bool {
         matches!(self, Provenance::User | Provenance::System)
     }
@@ -43,6 +50,7 @@ impl Provenance {
         match self {
             Provenance::User => "USER".into(),
             Provenance::System => "SYSTEM".into(),
+            Provenance::Monitor => "MONITOR".into(),
             Provenance::Tool { name, call_id } => format!("TOOL({name}#{call_id})"),
             Provenance::Web { url } => format!("WEB({url})"),
             Provenance::File { path } => format!("FILE({path})"),

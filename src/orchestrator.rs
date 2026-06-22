@@ -74,6 +74,19 @@ impl<M: Model, E: ToolExecutor> Session<M, E> {
     }
 
     pub async fn run(&mut self) -> SessionEnd {
+        let end = self.run_inner().await;
+        // Every session exit is hashed into the audit chain. Without this an
+        // attacker who exfiltrates secrets in the model's final answer leaves
+        // no chain-protected trace; the calling code receives the string and
+        // the audit log only shows the (allowed) reads that fed it.
+        match &end {
+            SessionEnd::Answer(text) => self.audit.record_answer(text),
+            SessionEnd::Halted { reason } => self.audit.record_halt(reason),
+        }
+        end
+    }
+
+    async fn run_inner(&mut self) -> SessionEnd {
         let started = Instant::now();
         let wall = Duration::from_secs(self.caps.spend.max_wall_seconds);
         let mut steps: u32 = 0;
@@ -123,8 +136,12 @@ impl<M: Model, E: ToolExecutor> Session<M, E> {
                         Verdict::Deny { reason } => {
                             consecutive_denials += 1;
                             self.model.notify_denial(&call, &reason).await;
+                            // Tag with `Provenance::Monitor`, not `System`:
+                            // the model must not be able to cite a denial
+                            // notification as user-authority justification for
+                            // retrying the same call (authority laundering).
                             self.push_chunk(
-                                Provenance::System,
+                                Provenance::Monitor,
                                 format!("[monitor denied last call: {reason}]"),
                             )
                             .await;

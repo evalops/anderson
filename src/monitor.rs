@@ -106,7 +106,7 @@ impl<'a> Monitor<'a> {
     pub fn decide(&mut self, call: &ToolCall, context: &[Chunk]) -> Verdict {
         let verdict = self.decide_inner(call, context);
         let record = Decision::from(&verdict);
-        self.audit.record(call, &record);
+        self.audit.record_decision(call, &record);
         if matches!(verdict, Verdict::Allow(_)) {
             *self.calls_made += 1;
         }

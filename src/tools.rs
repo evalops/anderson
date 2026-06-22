@@ -96,9 +96,18 @@ impl SandboxedExecutor {
     /// for its own post-open path re-check. Always pass the same paths you
     /// put in `Capabilities::fs_read` / `fs_write`.
     pub fn new(fs_read: Vec<String>, fs_write: Vec<String>, limits: ExecutorLimits) -> Self {
+        // No redirects. The capability check only inspects the URL the model
+        // proposed; if reqwest were allowed to follow a 3xx, an allow-listed
+        // origin could redirect the agent to anywhere (internal RFC1918
+        // hosts, cloud-metadata endpoints, exfil targets) and the resulting
+        // bytes would land in context tagged with the *original* URL's
+        // provenance — spoofing the source. The model can re-issue `net_get`
+        // with the redirect target and that fresh URL will go through
+        // `permits_net_get` like any other call.
         let http = reqwest::Client::builder()
             .timeout(limits.http_timeout)
             .connect_timeout(limits.http_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
         Self {
@@ -173,9 +182,12 @@ impl SandboxedExecutor {
     }
 
     async fn do_fs_write(&self, raw_path: &str, content: &str) -> Output {
-        // Resolve the parent (must exist), join the basename, and re-check
-        // that the result falls inside the write allow-list. The actual write
-        // uses O_NOFOLLOW on the leaf to refuse symlinked targets.
+        // Resolve which bundle prefix the target falls under, then open every
+        // component of the relative remainder with `O_NOFOLLOW`. A single
+        // `O_NOFOLLOW` on the leaf is *not* enough — an attacker who can
+        // write under any intermediate directory could swap it for a symlink
+        // between the canonicalize-parent step and the open, redirecting the
+        // write outside the bundle. Walking per-component refuses the swap.
         let path = PathBuf::from(raw_path);
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -190,13 +202,22 @@ impl SandboxedExecutor {
             None => return err("fs_write: empty file name".into()),
         };
         let canon = canon_parent.join(&basename);
-        if !Self::within(&self.fs_write_allow_prefixes, &canon) {
+        let Some(bundle_root) = self
+            .fs_write_allow_prefixes
+            .iter()
+            .find(|p| canon.starts_with(p))
+            .cloned()
+        else {
             return err(format!(
                 "fs_write denied: canonical path {} escapes the bundle",
                 canon.display()
             ));
-        }
-        if let Err(e) = open_write_no_follow(&canon, content.as_bytes()).await {
+        };
+        let relative = match canon.strip_prefix(&bundle_root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => return err("fs_write: internal path-resolution error".into()),
+        };
+        if let Err(e) = open_write_walked(&bundle_root, &relative, content.as_bytes()).await {
             return err(format!("fs_write {}: {e}", canon.display()));
         }
         Output {
@@ -237,10 +258,9 @@ impl SandboxedExecutor {
             let take = chunk.len().min(remaining);
             buf.extend_from_slice(&chunk[..take]);
         }
-        let mut body = String::from_utf8_lossy(&buf).into_owned();
-        body.insert_str(0, &format!("HTTP {status}\n\n"));
+        let body = String::from_utf8_lossy(&buf);
         Output {
-            content: body,
+            content: format!("HTTP {status}\n\n{body}"),
             provenance_hint: Some(Provenance::Web {
                 url: url.to_string(),
             }),
@@ -363,22 +383,95 @@ async fn open_read_no_follow(path: &str) -> std::io::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(std_file))
 }
 
-/// Write `content` to `path` with `O_NOFOLLOW` on the leaf. If the target is
-/// a symlink the open fails with `ELOOP` and no data is written.
-async fn open_write_no_follow(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = path.to_path_buf();
+/// Open the bundle root, then walk `relative` component-by-component with
+/// `openat(O_NOFOLLOW)`, finally creating/truncating the leaf and writing
+/// `content`. Any symlink encountered at any depth aborts with `ELOOP`; any
+/// `..` or other non-normal component is rejected outright. The bundle root
+/// itself is opened with `O_NOFOLLOW` so a swap of the root directory for a
+/// symlink is also refused.
+async fn open_write_walked(
+    bundle_root: &std::path::Path,
+    relative: &std::path::Path,
+    content: &[u8],
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    let bundle_root = bundle_root.to_path_buf();
+    let relative = relative.to_path_buf();
     let content = content.to_vec();
+
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW);
-        let mut f = opts.open(&path)?;
-        use std::io::Write;
-        f.write_all(&content)?;
-        f.sync_data()?;
+        let mut components: Vec<std::ffi::OsString> = Vec::new();
+        for comp in relative.components() {
+            match comp {
+                std::path::Component::Normal(n) => components.push(n.to_os_string()),
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("fs_write: disallowed path component {other:?}"),
+                    ));
+                }
+            }
+        }
+        if components.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fs_write: relative path resolves to bundle root",
+            ));
+        }
+
+        let c_root = std::ffi::CString::new(bundle_root.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let root_fd = unsafe {
+            libc::open(
+                c_root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if root_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut current: OwnedFd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+        let last = components.len() - 1;
+        for (i, comp) in components.iter().enumerate() {
+            let c_name = std::ffi::CString::new(comp.as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            if i == last {
+                let leaf_fd = unsafe {
+                    libc::openat(
+                        current.as_raw_fd(),
+                        c_name.as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_TRUNC
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o600 as libc::c_uint,
+                    )
+                };
+                if leaf_fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut leaf: std::fs::File = unsafe { OwnedFd::from_raw_fd(leaf_fd) }.into();
+                use std::io::Write;
+                leaf.write_all(&content)?;
+                leaf.sync_data()?;
+                return Ok(());
+            }
+            let next_fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            current = unsafe { OwnedFd::from_raw_fd(next_fd) };
+        }
         Ok(())
     })
     .await

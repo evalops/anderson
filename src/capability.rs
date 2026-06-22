@@ -191,11 +191,13 @@ impl Capabilities {
         }
         // Compare against the parsed URL's serialized form so the prefix
         // check sees a normalised authority + path, not whatever lexical
-        // surface the model emitted.
+        // surface the model emitted. We do *not* fall back to the raw input:
+        // the whole point of parsing is that the policy compares against the
+        // host that will actually be contacted, and a fallback to the raw
+        // string would resurrect every case-folding / percent-encoding
+        // bypass parsing exists to prevent.
         let normalised = parsed.as_str();
-        self.net_get
-            .iter()
-            .any(|p| normalised.starts_with(p) || url.starts_with(p))
+        self.net_get.iter().any(|p| normalised.starts_with(p))
     }
 
     pub fn permits_exec(&self, cmd: &str) -> bool {
