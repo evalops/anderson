@@ -41,7 +41,7 @@ async fn main() {
 
 mod anderson_bin {
     use anderson::audit::AuditLog;
-    use anderson::capability::{ActionClass, Capabilities, Spend};
+    use anderson::capability::{ActionClass, Capabilities, ExecRule, Spend};
     use anderson::model::{ModelStep, ScriptedModel};
     use anderson::openai::OpenAiModel;
     use anderson::orchestrator::{Session, SessionEnd};
@@ -114,7 +114,12 @@ mod anderson_bin {
             fs_read: vec![],
             fs_write: vec![],
             net_get: vec!["https://example.com/".into()],
-            exec: vec!["curl".into()],
+            // Deliberately loose so the capability check passes and the
+            // provenance check is what blocks the injected exec. A tighter
+            // bundle would use `ExecRule::new("curl",
+            // vec![ArgPattern::prefix("https://example.com/")])` for a
+            // belt-and-suspenders defence.
+            exec: vec![ExecRule::any_args("curl")],
             spend: Spend::restrictive(),
             require_confirm: vec![],
             require_user_intent: vec![ActionClass::Exec, ActionClass::FsWrite, ActionClass::NetGet],

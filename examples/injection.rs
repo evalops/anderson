@@ -6,7 +6,7 @@
 //! The monitor rejects it because the cited justification is WEB-provenance,
 //! not USER-provenance. The model then revises its plan and stops cleanly.
 
-use anderson::capability::{ActionClass, Capabilities, Spend};
+use anderson::capability::{ActionClass, Capabilities, ExecRule, Spend};
 use anderson::model::{ModelStep, ScriptedModel};
 use anderson::monitor::Decision;
 use anderson::orchestrator::{Session, SessionEnd};
@@ -46,7 +46,7 @@ async fn main() {
         fs_read: vec![],
         fs_write: vec![],
         net_get: vec!["https://example.com/".into()],
-        exec: vec!["curl".into()],
+        exec: vec![ExecRule::any_args("curl")],
         spend: Spend::restrictive(),
         require_confirm: vec![],
         require_user_intent: vec![ActionClass::Exec, ActionClass::FsWrite, ActionClass::NetGet],

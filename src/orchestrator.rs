@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::audit::AuditLog;
 use crate::capability::Capabilities;
 use crate::model::{Model, ModelStep};
-use crate::monitor::{Decision, Monitor};
+use crate::monitor::{Monitor, Verdict};
 use crate::provenance::{Chunk, Provenance};
 use crate::tools::ToolExecutor;
 
@@ -41,11 +41,15 @@ pub struct Session<M: Model, E: ToolExecutor> {
 
 impl<M: Model, E: ToolExecutor> Session<M, E> {
     pub fn new(model: M, executor: E, caps: Capabilities) -> Self {
+        Self::with_audit(model, executor, caps, AuditLog::new())
+    }
+
+    pub fn with_audit(model: M, executor: E, caps: Capabilities, audit: AuditLog) -> Self {
         Self {
             model,
             executor,
             caps,
-            audit: AuditLog::new(),
+            audit,
             context: Vec::new(),
             next_chunk_id: 0,
             next_call_id: 0,
@@ -98,17 +102,17 @@ impl<M: Model, E: ToolExecutor> Session<M, E> {
             match step {
                 ModelStep::Stop { answer } => return SessionEnd::Answer(answer),
                 ModelStep::Call(call) => {
-                    let decision = {
+                    let verdict = {
                         let mut monitor =
                             Monitor::new(&self.caps, &mut self.audit, &mut self.calls_made);
                         monitor.decide(&call, &self.context)
                     };
-                    match decision {
-                        Decision::Allow => {
+                    match verdict {
+                        Verdict::Allow(allowed) => {
                             consecutive_denials = 0;
                             let call_id = self.next_call_id;
                             self.next_call_id += 1;
-                            let output = self.executor.execute(&call.action).await;
+                            let output = self.executor.execute(&allowed).await;
                             let provenance =
                                 output.provenance_hint.unwrap_or_else(|| Provenance::Tool {
                                     name: format!("{:?}", call.action_class()),
@@ -116,7 +120,7 @@ impl<M: Model, E: ToolExecutor> Session<M, E> {
                                 });
                             self.push_chunk(provenance, output.content).await;
                         }
-                        Decision::Deny { reason } => {
+                        Verdict::Deny { reason } => {
                             consecutive_denials += 1;
                             self.model.notify_denial(&call, &reason).await;
                             self.push_chunk(
@@ -133,7 +137,7 @@ impl<M: Model, E: ToolExecutor> Session<M, E> {
                                 };
                             }
                         }
-                        Decision::Escalate { reason } => {
+                        Verdict::Escalate { reason } => {
                             // POC halts on escalation. A real harness would
                             // pause for human input on the specific call.
                             return SessionEnd::Halted {

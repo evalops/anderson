@@ -13,12 +13,16 @@
 //! between an assistant's tool call and its result message.
 //!
 //! Multi-tool-call assistant turns: the protocol allows the model to return
-//! several `tool_calls` in one assistant message. The harness processes the
-//! first and synthesises "ignored" tool results for the rest, so the next
-//! turn's history remains protocol-valid. The system prompt asks the model
-//! to issue one tool call per turn anyway.
+//! several `tool_calls` in one assistant message. The harness queues every
+//! call from the same assistant turn and drains them one per
+//! [`Model::next_step`] — each gets full monitor scrutiny and a real result.
+//! The original implementation processed only the first and synthesised
+//! "ignored" tool results for the rest, which silently dropped the model's
+//! intent.
 //!
 //! [`async-openai`]: https://github.com/64bit/async-openai
+
+use std::collections::VecDeque;
 
 use async_openai::{
     config::OpenAIConfig,
@@ -62,10 +66,13 @@ pub struct OpenAiModel {
     model: String,
     messages: Vec<ChatCompletionRequestMessage>,
     tools: Vec<ChatCompletionTool>,
-    /// `tool_call_id` of the *first* tool call from the most recent assistant
-    /// turn — the one we surfaced to the orchestrator and whose result we are
-    /// now waiting for via `notify_chunk` or `notify_denial`.
-    pending_tool_call_id: Option<String>,
+    /// Tool calls from the most recent assistant message that haven't been
+    /// surfaced to the orchestrator yet. Each `next_step` pops one; when the
+    /// queue empties, the next `next_step` hits the API for a new turn.
+    pending_calls: VecDeque<ChatCompletionMessageToolCall>,
+    /// `tool_call_id` of the call currently in flight — the one whose result
+    /// is awaited via `notify_chunk` or `notify_denial`.
+    in_flight_call_id: Option<String>,
 }
 
 impl OpenAiModel {
@@ -85,7 +92,8 @@ impl OpenAiModel {
             model: model.into(),
             messages: vec![system.into()],
             tools: tool_definitions(),
-            pending_tool_call_id: None,
+            pending_calls: VecDeque::new(),
+            in_flight_call_id: None,
         }
     }
 }
@@ -93,6 +101,18 @@ impl OpenAiModel {
 #[async_trait]
 impl Model for OpenAiModel {
     async fn next_step(&mut self, _context: &[Chunk]) -> ModelStep {
+        // If the most recent assistant turn produced more tool calls than we
+        // have surfaced yet, drain the queue before hitting the API again.
+        if let Some(tc) = self.pending_calls.pop_front() {
+            self.in_flight_call_id = Some(tc.id.clone());
+            return match parse_tool_call(&tc) {
+                Ok(parsed) => ModelStep::Call(parsed),
+                Err(e) => ModelStep::Stop {
+                    answer: format!("openai: bad tool call: {e}"),
+                },
+            };
+        }
+
         let request = match CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages(self.messages.clone())
@@ -137,28 +157,21 @@ impl Model for OpenAiModel {
 
         match msg.tool_calls {
             Some(calls) if !calls.is_empty() => {
-                // Synthesise "ignored" tool result messages for every call past
-                // the first, so the protocol stays valid on the next turn.
-                for tc in calls.iter().skip(1) {
-                    if let Ok(tool_msg) = ChatCompletionRequestToolMessageArgs::default()
-                        .tool_call_id(tc.id.as_str())
-                        .content("(ignored: harness processes one tool call per turn)")
-                        .build()
-                    {
-                        self.messages.push(tool_msg.into());
-                    }
-                }
-                let first = &calls[0];
-                self.pending_tool_call_id = Some(first.id.clone());
-                match parse_tool_call(first) {
-                    Ok(tc) => ModelStep::Call(tc),
+                // Queue every tool call from this assistant turn and pop the
+                // first. Each subsequent `next_step` will pop the next one, so
+                // every tool call goes through the monitor.
+                self.pending_calls.extend(calls);
+                let first = self.pending_calls.pop_front().expect("non-empty");
+                self.in_flight_call_id = Some(first.id.clone());
+                match parse_tool_call(&first) {
+                    Ok(parsed) => ModelStep::Call(parsed),
                     Err(e) => ModelStep::Stop {
                         answer: format!("openai: bad tool call: {e}"),
                     },
                 }
             }
             _ => {
-                self.pending_tool_call_id = None;
+                self.in_flight_call_id = None;
                 ModelStep::Stop {
                     answer: msg.content.unwrap_or_default(),
                 }
@@ -188,7 +201,7 @@ impl Model for OpenAiModel {
             // call. Tag the body with the provenance so the model can reason
             // about which content is intent-trusted and which is not.
             Provenance::Tool { .. } | Provenance::File { .. } | Provenance::Web { .. } => {
-                let Some(id) = self.pending_tool_call_id.take() else {
+                let Some(id) = self.in_flight_call_id.take() else {
                     // No pending tool call — surface as a user message so the
                     // model still sees it.
                     if let Ok(user) = ChatCompletionRequestUserMessageArgs::default()
@@ -224,7 +237,7 @@ impl Model for OpenAiModel {
     async fn notify_denial(&mut self, _call: &ToolCall, reason: &str) {
         // The model's pending tool call was denied. Provide a synthetic tool
         // result so the protocol stays valid and the model sees why.
-        if let Some(id) = self.pending_tool_call_id.take() {
+        if let Some(id) = self.in_flight_call_id.take() {
             if let Ok(tool_msg) = ChatCompletionRequestToolMessageArgs::default()
                 .tool_call_id(id)
                 .content(format!("MONITOR DENIED: {reason}\nRevise your plan."))

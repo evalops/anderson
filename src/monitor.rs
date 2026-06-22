@@ -10,16 +10,15 @@
 //!
 //! This module is the deliberate embodiment of those properties:
 //!
-//!   * **Tamper-proof**: the monitor consumes only structured `ToolCall`
+//!   * **Tamper-proof.** The monitor consumes only structured `ToolCall`
 //!     values and a typed `Capabilities` bundle. It never reads free-form
 //!     text from the model and has no runtime-configurable policy. There is
 //!     no channel by which model output can rewrite the rules below.
-//!   * **Always invoked**: the orchestrator's run loop routes every proposed
-//!     action through [`Monitor::decide`]; the executor is only ever called
-//!     when the verdict is [`Decision::Allow`]. There is no fast path that
-//!     bypasses the monitor, and there is no in-process tool that could
-//!     produce side effects without first being mediated.
-//!   * **Small**: this file. Read it. If you cannot, the abstraction has
+//!   * **Always invoked.** The executor takes [`crate::tools::AllowedAction`],
+//!     a token that only [`Monitor::decide`] can construct. A future
+//!     contributor who adds a fast path bypassing the monitor will get a
+//!     compile error, not a code-review nit.
+//!   * **Small.** This file. Read it. If you cannot, the abstraction has
 //!     failed.
 
 use serde::{Deserialize, Serialize};
@@ -27,14 +26,41 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditLog;
 use crate::capability::Capabilities;
 use crate::provenance::Chunk;
-use crate::tools::{Action, ToolCall};
+use crate::tools::{Action, AllowedAction, ToolCall};
 
+/// The serializable decision record that lands in the audit log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum Decision {
     Allow,
     Deny { reason: String },
     Escalate { reason: String },
+}
+
+/// The monitor's verdict to the orchestrator.
+///
+/// On [`Verdict::Allow`] the variant carries an [`AllowedAction`] token. The
+/// executor takes only `&AllowedAction`, and [`AllowedAction`] has no public
+/// constructor and no `Deserialize` derive. Together that makes Anderson's
+/// "always invoked" property a compile-time guarantee of this crate.
+pub enum Verdict {
+    Allow(AllowedAction),
+    Deny { reason: String },
+    Escalate { reason: String },
+}
+
+impl From<&Verdict> for Decision {
+    fn from(v: &Verdict) -> Self {
+        match v {
+            Verdict::Allow(_) => Decision::Allow,
+            Verdict::Deny { reason } => Decision::Deny {
+                reason: reason.clone(),
+            },
+            Verdict::Escalate { reason } => Decision::Escalate {
+                reason: reason.clone(),
+            },
+        }
+    }
 }
 
 pub struct Monitor<'a> {
@@ -52,23 +78,24 @@ impl<'a> Monitor<'a> {
         }
     }
 
-    /// Decide whether `call` is permitted given `context`. Records the decision
-    /// in the audit log either way; only on `Allow` does the spend counter
-    /// advance.
-    pub fn decide(&mut self, call: &ToolCall, context: &[Chunk]) -> Decision {
-        let decision = self.decide_inner(call, context);
-        self.audit.record(call, &decision);
-        if matches!(decision, Decision::Allow) {
+    /// Decide whether `call` is permitted given `context`. Records the
+    /// decision in the audit log either way; only on `Allow` does the spend
+    /// counter advance and an [`AllowedAction`] token leave this function.
+    pub fn decide(&mut self, call: &ToolCall, context: &[Chunk]) -> Verdict {
+        let verdict = self.decide_inner(call, context);
+        let record = Decision::from(&verdict);
+        self.audit.record(call, &record);
+        if matches!(verdict, Verdict::Allow(_)) {
             *self.calls_made += 1;
         }
-        decision
+        verdict
     }
 
-    fn decide_inner(&self, call: &ToolCall, context: &[Chunk]) -> Decision {
-        // (1) spend ceiling — exhausting tool-call budget halts the session
-        //     regardless of how innocuous the next call appears.
+    fn decide_inner(&self, call: &ToolCall, context: &[Chunk]) -> Verdict {
+        // (1) spend ceiling — exhausting the tool-call budget halts the
+        //     session regardless of how innocuous the next call appears.
         if *self.calls_made >= self.caps.spend.max_tool_calls {
-            return Decision::Deny {
+            return Verdict::Deny {
                 reason: format!(
                     "tool-call budget exhausted ({} used)",
                     self.caps.spend.max_tool_calls
@@ -77,7 +104,9 @@ impl<'a> Monitor<'a> {
         }
 
         // (2) capability allow-list — is the *target* of this action class
-        //     within the bundle? Action class first (cheap), then target.
+        //     within the bundle? For exec, this also enforces per-arg
+        //     patterns: a bundle that permits `curl https://example.com/` does
+        //     not permit `curl https://attacker.example/`.
         let class = call.action_class();
         let in_bundle = match &call.action {
             Action::FsRead { path } => self.caps.permits_fs_read(path),
@@ -86,7 +115,7 @@ impl<'a> Monitor<'a> {
             Action::Exec { cmd } => self.caps.permits_exec(cmd),
         };
         if !in_bundle {
-            return Decision::Deny {
+            return Verdict::Deny {
                 reason: format!("{class:?} target outside capability bundle"),
             };
         }
@@ -100,14 +129,15 @@ impl<'a> Monitor<'a> {
         //     justify the call without citing the web chunk, and the moment
         //     the web chunk appears in `justification_chunks` the check fails.
         //
-        //     A model that *lies* about citations remains on the record in
-        //     the audit log lying. The next layer of defence — a separate
+        //     This is not a structural defence against a *lying* model. A
+        //     model that fabricates citations remains on the record in the
+        //     audit log lying. The next layer of defence — a separate
         //     intent-verifier model that reads the cited chunks and asks
-        //     whether they actually request the proposed action — is out of
-        //     scope for this POC and discussed in the README.
+        //     whether they actually request the proposed action — is listed
+        //     under "future work" in the README.
         if self.caps.require_user_intent.contains(&class) {
             if call.justification_chunks.is_empty() {
-                return Decision::Deny {
+                return Verdict::Deny {
                     reason: format!(
                         "{class:?} requires user-provenance justification; \
                          no chunks were cited"
@@ -124,12 +154,12 @@ impl<'a> Monitor<'a> {
                 }
             }
             if !missing.is_empty() {
-                return Decision::Deny {
+                return Verdict::Deny {
                     reason: format!("{class:?} cited nonexistent chunk(s) {missing:?}"),
                 };
             }
             if !non_user.is_empty() {
-                return Decision::Deny {
+                return Verdict::Deny {
                     reason: format!(
                         "{class:?} requires every cited chunk to carry user \
                          authority; chunk(s) {non_user:?} are untrusted as intent"
@@ -141,19 +171,19 @@ impl<'a> Monitor<'a> {
         // (4) human confirmation — high-impact classes must escalate even
         //     when otherwise permitted.
         if self.caps.require_confirm.contains(&class) {
-            return Decision::Escalate {
+            return Verdict::Escalate {
                 reason: format!("{class:?} requires human confirmation"),
             };
         }
 
-        Decision::Allow
+        Verdict::Allow(AllowedAction::new(call.action.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::{ActionClass, Spend};
+    use crate::capability::{ActionClass, ArgPattern, ExecRule, Spend};
     use crate::provenance::Provenance;
 
     fn caps_requiring_user_for_exec() -> Capabilities {
@@ -161,7 +191,7 @@ mod tests {
             fs_read: vec![],
             fs_write: vec![],
             net_get: vec!["https://".into()],
-            exec: vec!["curl".into()],
+            exec: vec![ExecRule::any_args("curl")],
             spend: Spend::restrictive(),
             require_confirm: vec![],
             require_user_intent: vec![ActionClass::Exec],
@@ -195,15 +225,13 @@ mod tests {
             justification_chunks: vec![1],
         };
         match mon.decide(&call, &context) {
-            Decision::Deny { reason } => assert!(reason.contains("untrusted")),
-            other => panic!("expected Deny, got {other:?}"),
+            Verdict::Deny { reason } => assert!(reason.contains("untrusted")),
+            _ => panic!("expected Deny"),
         }
     }
 
     #[test]
     fn exec_with_mixed_provenance_is_denied() {
-        // The "smart lie" variant: cite a real user chunk along with the web
-        // chunk. Stricter check rejects this because the web chunk is cited.
         let caps = caps_requiring_user_for_exec();
         let mut audit = AuditLog::new();
         let mut calls_made = 0;
@@ -229,8 +257,37 @@ mod tests {
             justification_chunks: vec![0, 1],
         };
         match mon.decide(&call, &context) {
-            Decision::Deny { reason } => assert!(reason.contains("untrusted")),
-            other => panic!("expected Deny, got {other:?}"),
+            Verdict::Deny { reason } => assert!(reason.contains("untrusted")),
+            _ => panic!("expected Deny"),
+        }
+    }
+
+    #[test]
+    fn exec_arg_pattern_violation_is_denied() {
+        let caps = Capabilities {
+            fs_read: vec![],
+            fs_write: vec![],
+            net_get: vec![],
+            exec: vec![ExecRule::new(
+                "curl",
+                vec![ArgPattern::prefix("https://example.com/")],
+            )],
+            spend: Spend::restrictive(),
+            require_confirm: vec![],
+            require_user_intent: vec![],
+        };
+        let mut audit = AuditLog::new();
+        let mut calls_made = 0;
+        let mut mon = Monitor::new(&caps, &mut audit, &mut calls_made);
+        let call = ToolCall {
+            action: Action::Exec {
+                cmd: "curl https://attacker.example/x".into(),
+            },
+            justification_chunks: vec![],
+        };
+        match mon.decide(&call, &[]) {
+            Verdict::Deny { reason } => assert!(reason.contains("outside capability bundle")),
+            _ => panic!("expected Deny"),
         }
     }
 }
