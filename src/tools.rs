@@ -193,12 +193,21 @@ impl SandboxedExecutor {
     }
 
     async fn do_fs_write(&self, raw_path: &str, content: &str) -> Output {
-        // Resolve which bundle prefix the target falls under, then open every
-        // component of the relative remainder with `O_NOFOLLOW`. A single
-        // `O_NOFOLLOW` on the leaf is *not* enough — an attacker who can
-        // write under any intermediate directory could swap it for a symlink
-        // between the canonicalize-parent step and the open, redirecting the
-        // write outside the bundle. Walking per-component refuses the swap.
+        // Symmetric with do_fs_read:
+        //
+        //   1. Canonicalise the parent (path resolution only — no open or
+        //      write against the target). Combined with the bundle-prefix
+        //      check below this rejects out-of-bundle targets *before* any
+        //      write-syscall fires.
+        //   2. Walk from the bundle-root dir fd with `openat(O_NOFOLLOW)`
+        //      per component, opening the leaf O_WRONLY|O_CREAT|O_TRUNC|
+        //      O_NOFOLLOW. A symlink at any depth fails ELOOP; `..` and
+        //      other non-normal components are rejected outright.
+        //
+        // Error messages do *not* echo the resolved canonical path or the
+        // underlying OS error: that would turn out-of-bundle denials and
+        // write-syscall failures into an existence/path oracle for the
+        // surrounding filesystem.
         let path = PathBuf::from(raw_path);
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -206,7 +215,7 @@ impl SandboxedExecutor {
         };
         let canon_parent = match tokio::fs::canonicalize(&parent).await {
             Ok(p) => p,
-            Err(e) => return err(format!("canonicalize parent {}: {e}", parent.display())),
+            Err(_) => return err("fs_write denied: target outside the bundle".into()),
         };
         let basename = match path.file_name() {
             Some(n) => n.to_owned(),
@@ -219,17 +228,17 @@ impl SandboxedExecutor {
             .find(|p| canon.starts_with(p))
             .cloned()
         else {
-            return err(format!(
-                "fs_write denied: canonical path {} escapes the bundle",
-                canon.display()
-            ));
+            return err("fs_write denied: target outside the bundle".into());
         };
         let relative = match canon.strip_prefix(&bundle_root) {
             Ok(r) => r.to_path_buf(),
             Err(_) => return err("fs_write: internal path-resolution error".into()),
         };
-        if let Err(e) = open_write_walked(&bundle_root, &relative, content.as_bytes()).await {
-            return err(format!("fs_write {}: {e}", canon.display()));
+        if open_write_walked(&bundle_root, &relative, content.as_bytes())
+            .await
+            .is_err()
+        {
+            return err("fs_write denied: open failed".into());
         }
         Output {
             content: format!("wrote {} bytes to {}", content.len(), canon.display()),
@@ -729,5 +738,70 @@ mod tests {
         // The victim file outside the bundle must not have been overwritten.
         let after = std::fs::read(&target).expect("read victim");
         assert_eq!(after, b"original");
+        // The denial must not echo the out-of-bundle resolved path: that
+        // would turn a write denial into a path/existence oracle for the
+        // surrounding fs (the same hardening fs_read already does).
+        assert!(
+            !out.content.contains(outside.path().to_str().unwrap()),
+            "denial leaked the resolved out-of-bundle path: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_write_denial_does_not_echo_resolved_path() {
+        // An intermediate-symlink target whose resolved canonical path lies
+        // outside the bundle must denied generically. Echoing the resolved
+        // path (or the underlying OS error) lets a model under prompt
+        // injection probe arbitrary host paths through write attempts.
+        let bundle = tempfile::tempdir().expect("bundle");
+        let outside = tempfile::tempdir().expect("outside");
+        let symdir = bundle.path().join("doorway");
+        std::os::unix::fs::symlink(outside.path(), &symdir).expect("symlink");
+
+        let executor = SandboxedExecutor::new(
+            vec![],
+            vec![bundle.path().display().to_string() + "/**"],
+            ExecutorLimits::default(),
+        );
+        let target = symdir.join("victim.txt");
+        let out = executor
+            .do_fs_write(&target.display().to_string(), "hostile")
+            .await;
+        assert!(out.content.starts_with("error:"), "got: {}", out.content);
+        let outside_canon = std::fs::canonicalize(outside.path()).expect("canonicalize");
+        assert!(
+            !out.content.contains(outside_canon.to_str().unwrap()),
+            "denial leaked the resolved out-of-bundle path: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_write_canonicalize_failure_does_not_leak_probe_path() {
+        // A model that writes to a non-existent path used to receive
+        // "canonicalize parent <path>: <os error>" back — a per-component
+        // existence oracle for the surrounding filesystem. The denial must
+        // be generic.
+        let bundle = tempfile::tempdir().expect("bundle");
+        let executor = SandboxedExecutor::new(
+            vec![],
+            vec![bundle.path().display().to_string() + "/**"],
+            ExecutorLimits::default(),
+        );
+        let out = executor
+            .do_fs_write("/proc/3735928559/fd/0", "hostile")
+            .await;
+        assert!(out.content.starts_with("error:"), "got: {}", out.content);
+        assert!(
+            !out.content.contains("3735928559"),
+            "probed path echoed back: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("No such file"),
+            "OS error leaked: {}",
+            out.content
+        );
     }
 }

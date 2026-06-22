@@ -191,9 +191,19 @@ impl Model for OpenAiModel {
                 self.in_flight_call_id = Some(first.id.clone());
                 match parse_tool_call(&first) {
                     Ok(parsed) => ModelStep::Call(parsed),
-                    Err(e) => ModelStep::Stop {
-                        answer: format!("openai: bad tool call: {e}"),
-                    },
+                    Err(e) => {
+                        // Same invariant as the queued-path branch above: a
+                        // parse failure means no notify_chunk / notify_denial
+                        // will land a tool reply for this id. Clear the
+                        // dangling reference and drop the rest of the turn's
+                        // pending calls; Stop ends the session, but the type
+                        // invariant should hold regardless of caller use.
+                        self.in_flight_call_id = None;
+                        self.pending_calls.clear();
+                        ModelStep::Stop {
+                            answer: format!("openai: bad tool call: {e}"),
+                        }
+                    }
                 }
             }
             _ => {

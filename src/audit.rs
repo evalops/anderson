@@ -190,13 +190,16 @@ impl AuditLog {
     }
 
     /// One JSON object per line — the conventional shape for a log a separate
-    /// process can tail and forward.
+    /// process can tail and forward. Every record (including the last) ends
+    /// with `\n`, matching what [`JsonlFileSink`] writes on disk.
     pub fn to_jsonl(&self) -> String {
-        self.entries
-            .iter()
-            .map(|e| serde_json::to_string(e).expect("AuditEntry is serialisable"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut s = String::new();
+        for e in &self.entries {
+            let line = serde_json::to_string(e).expect("AuditEntry is serialisable");
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s
     }
 }
 
@@ -308,6 +311,23 @@ mod tests {
         match log.verify_chain() {
             Err(e) => assert!(e.contains("simulated disk failure"), "got: {e}"),
             Ok(()) => panic!("expected verify_chain to surface persist error"),
+        }
+    }
+
+    #[test]
+    fn to_jsonl_matches_sink_shape() {
+        // The in-memory dump and the on-disk sink must agree: one JSON object
+        // per line, every line (including the last) terminated by `\n`. A
+        // tail-and-forward consumer cannot distinguish the two sources.
+        let mut log = AuditLog::new();
+        log.record_decision(&sample_call(), &Decision::Allow);
+        log.record_answer("done");
+        let dump = log.to_jsonl();
+        assert!(dump.ends_with('\n'), "to_jsonl missing trailing newline");
+        assert_eq!(dump.matches('\n').count(), 2);
+        for line in dump.lines() {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each line must be valid JSON");
         }
     }
 
